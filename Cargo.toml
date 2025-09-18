@@ -1,0 +1,50 @@
+[workspace]
+members = [
+    "crates/aidb-core",
+    "crates/aidb-index-bf",
+    "crates/aidb-index-hnsw",
+    "crates/aidb-index-adaptive",
+    "crates/aidb-storage",
+    "crates/aidb-storage-engine",
+    "crates/aidb-server",
+    "crates/aidb-bench",
+    "crates/aidb-monitor",
+]
+
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.70"
+
+[workspace.dependencies]
+anyhow = "1"
+bincode = "1"
+env_logger = "0.10"
+log = "0.4"
+parking_lot = "0.12"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+time = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.8"
+wide = "0.7"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+reqwest = { version = "0.11", features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+num_cpus = "1.16"
+dashmap = "5.5"
+memmap2 = "0.9"
+crossbeam = "0.8"
+atomic = "0.6"
+bytemuck = { version = "1.14", features = ["derive"] }
+lz4_flex = "0.11"
+zstd = "0.13"
+crc32fast = "1.3"

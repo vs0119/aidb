@@ -1,0 +1,13 @@
+[package]
+name = "aidb-index-hnsw"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aidb-core = { path = "../aidb-core" }
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+rayon.workspace = true
+thiserror.workspace = true

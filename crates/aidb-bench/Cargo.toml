@@ -1,0 +1,15 @@
+[package]
+name = "aidb-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aidb-core = { path = "../aidb-core" }
+aidb-index-bf = { path = "../aidb-index-bf" }
+aidb-index-hnsw = { path = "../aidb-index-hnsw" }
+rand.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+uuid.workspace = true
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "gzip", "brotli", "deflate", "stream"] }

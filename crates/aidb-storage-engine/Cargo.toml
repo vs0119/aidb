@@ -1,0 +1,25 @@
+[package]
+name = "aidb-storage-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aidb-core = { path = "../aidb-core" }
+anyhow.workspace = true
+bincode.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
+dashmap = "5.5"
+memmap2 = "0.9"
+crossbeam = "0.8"
+atomic = "0.6"
+bytemuck = { version = "1.14", features = ["derive"] }
+lz4_flex = "0.11"
+zstd = "0.13"
+crc32fast.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "aidb-index-bf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aidb-core = { path = "../aidb-core" }
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+

@@ -1,0 +1,20 @@
+[package]
+name = "aidb-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aidb-core = { path = "../aidb-core" }
+aidb-index-bf = { path = "../aidb-index-bf" }
+aidb-index-hnsw = { path = "../aidb-index-hnsw" }
+aidb-storage = { path = "../aidb-storage" }
+anyhow.workspace = true
+axum = "0.7"
+env_logger.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["full"] }
+uuid.workspace = true
+chrono.workspace = true
