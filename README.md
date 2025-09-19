@@ -14,6 +14,7 @@ This repository is a scaffold that runs locally and establishes clean boundaries
 - `crates/aidb-index-bf`: Brute-force index with parallel scoring
 - `crates/aidb-storage`: WAL, in-memory collection, simple engine
 - `crates/aidb-server`: Axum HTTP server exposing collection + search APIs
+- `crates/aidb-sql`: Lightweight in-memory SQL database for quick relational prototyping
 
 ## Building & Running
 
@@ -70,8 +71,39 @@ cargo run -p aidb-bench --release -- --mode=http --report=csv --out=bench.csv
   "filter": {"source": "a.txt"}
 }
 ```
-
 - `DELETE /collections/:name/points/:id` – delete a point
+
+- `POST /sql` – execute SQL-style commands directly against AIDB (see
+  [`docs/sql.md`](docs/sql.md) for full syntax)
+  - `CREATE COLLECTION docs (DIM = 768, METRIC = 'cosine', INDEX = 'hnsw');`
+  - `INSERT INTO docs VALUES (ID = '...', VECTOR = [0.1, 0.2, ...], PAYLOAD = {"source": "a.txt"});`
+  - `SEARCH docs (VECTOR = [0.1, 0.2, ...], TOPK = 5, FILTER = {"source": "a.txt"});`
+
+## Embedded SQL Database
+
+`aidb-sql` offers a self-contained SQL execution engine that complements the
+vector APIs for quick prototyping. It currently supports:
+
+- `CREATE TABLE` with `INT`, `FLOAT`, `TEXT`, and `BOOLEAN` columns.
+- `INSERT` statements (with optional column lists) and multi-row values.
+- `SELECT` queries with column projections, `SELECT *`, and simple `WHERE`
+  equality predicates.
+
+Example:
+
+```rust
+use aidb_sql::{QueryResult, SqlDatabase, Value};
+
+let mut db = SqlDatabase::new();
+db.execute("CREATE TABLE users (id INT, name TEXT, active BOOLEAN);")?;
+db.execute("INSERT INTO users VALUES (1, 'Ada', true), (2, 'Grace', false);")?;
+match db.execute("SELECT name FROM users WHERE active = true;")? {
+    QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Text("Ada".into())),
+    _ => unreachable!(),
+}
+```
+
+See the crate's unit tests for additional examples.
 
 ## Performance Roadmap
 

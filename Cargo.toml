@@ -9,6 +9,7 @@ members = [
     "crates/aidb-server",
     "crates/aidb-bench",
     "crates/aidb-monitor",
+    "crates/aidb-sql",
 ]
 
 resolver = "2"
