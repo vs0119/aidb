@@ -1,4 +1,9 @@
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound::Included;
+
+use chrono::Datelike;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
 use thiserror::Error;
 
@@ -8,6 +13,7 @@ pub enum Value {
     Float(f64),
     Text(String),
     Boolean(bool),
+    Timestamp(DateTime<Utc>),
     Null,
 }
 
@@ -23,17 +29,85 @@ enum ColumnType {
     Float,
     Text,
     Boolean,
+    Timestamp,
 }
 
 #[derive(Debug, Default)]
 struct Table {
     columns: Vec<Column>,
     rows: Vec<Vec<Value>>,
+    partitioning: Option<TimePartitioning>,
+    partitions: BTreeMap<PartitionKey, Vec<usize>>,
+}
+
+#[derive(Debug, Default)]
+struct Graph {
+    nodes: HashMap<String, GraphNode>,
+    edges: Vec<GraphEdge>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct GraphNode {
+    id: String,
+    properties: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+struct GraphEdge {
+    from: String,
+    to: String,
+    label: Option<String>,
+    properties: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+struct TimePartitioning {
+    column_index: usize,
+    column_name: String,
+    granularity: PartitionGranularity,
+}
+
+impl TimePartitioning {
+    fn matches_column(&self, column: &str) -> bool {
+        self.column_name.eq_ignore_ascii_case(column)
+    }
+
+    fn partition_key(&self, value: &Value) -> Option<PartitionKey> {
+        match value {
+            Value::Timestamp(timestamp) => Some(self.partition_key_from_datetime(timestamp)),
+            _ => None,
+        }
+    }
+
+    fn partition_key_from_datetime(&self, timestamp: &DateTime<Utc>) -> PartitionKey {
+        match self.granularity {
+            PartitionGranularity::Day => {
+                let days = timestamp.date_naive().num_days_from_ce();
+                PartitionKey(days as i64)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PartitionKey(i64);
+
+#[derive(Debug, Clone, Copy)]
+enum PartitionGranularity {
+    Day,
+}
+
+#[derive(Debug, Clone)]
+struct PartitioningInfo {
+    column: String,
+    granularity: PartitionGranularity,
 }
 
 #[derive(Debug)]
 pub struct SqlDatabase {
     tables: HashMap<String, Table>,
+    graphs: HashMap<String, Graph>,
 }
 
 #[derive(Debug, Error)]
@@ -48,6 +122,16 @@ pub enum SqlDatabaseError {
     UnknownColumn(String),
     #[error("schema mismatch: {0}")]
     SchemaMismatch(String),
+    #[error("partition column '{0}' requires TIMESTAMP type")]
+    InvalidPartitionColumn(String),
+    #[error("graph '{0}' already exists")]
+    GraphExists(String),
+    #[error("graph '{0}' does not exist")]
+    UnknownGraph(String),
+    #[error("node '{1}' already exists in graph '{0}'")]
+    NodeExists(String, String),
+    #[error("graph '{0}' does not contain node '{1}'")]
+    UnknownGraphNode(String, String),
     #[error("unsupported statement")]
     Unsupported,
 }
@@ -66,14 +150,19 @@ impl SqlDatabase {
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
+            graphs: HashMap::new(),
         }
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, SqlDatabaseError> {
         let stmt = parse_statement(sql)?;
         match stmt {
-            Statement::CreateTable { name, columns } => {
-                self.exec_create_table(name, columns)?;
+            Statement::CreateTable {
+                name,
+                columns,
+                partitioning,
+            } => {
+                self.exec_create_table(name, columns, partitioning)?;
                 Ok(QueryResult::None)
             }
             Statement::Insert {
@@ -89,6 +178,35 @@ impl SqlDatabase {
                 columns,
                 predicate,
             } => self.exec_select(table, columns, predicate),
+            Statement::CreateGraph { name } => {
+                self.exec_create_graph(name)?;
+                Ok(QueryResult::None)
+            }
+            Statement::CreateNode {
+                graph,
+                id,
+                properties,
+            } => {
+                self.exec_create_node(graph, id, properties)?;
+                Ok(QueryResult::None)
+            }
+            Statement::CreateEdge {
+                graph,
+                from,
+                to,
+                label,
+                properties,
+            } => {
+                self.exec_create_edge(graph, from, to, label, properties)?;
+                Ok(QueryResult::None)
+            }
+            Statement::MatchGraph {
+                graph,
+                from,
+                to,
+                label,
+                property_filter,
+            } => self.exec_match_graph(graph, from, to, label, property_filter),
         }
     }
 
@@ -96,6 +214,7 @@ impl SqlDatabase {
         &mut self,
         name: String,
         columns: Vec<(String, ColumnType)>,
+        partitioning: Option<PartitioningInfo>,
     ) -> Result<(), SqlDatabaseError> {
         if self.tables.contains_key(&name) {
             return Err(SqlDatabaseError::TableExists(name));
@@ -108,6 +227,22 @@ impl SqlDatabase {
         let mut table = Table::default();
         for (name, ty) in columns {
             table.columns.push(Column { name, ty });
+        }
+        if let Some(info) = partitioning {
+            let column_index = table
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&info.column))
+                .ok_or_else(|| SqlDatabaseError::UnknownColumn(info.column.clone()))?;
+            if table.columns[column_index].ty != ColumnType::Timestamp {
+                return Err(SqlDatabaseError::InvalidPartitionColumn(info.column));
+            }
+            let column_name = table.columns[column_index].name.clone();
+            table.partitioning = Some(TimePartitioning {
+                column_index,
+                column_name,
+                granularity: info.granularity,
+            });
         }
         self.tables.insert(name, table);
         Ok(())
@@ -152,7 +287,15 @@ impl SqlDatabase {
                 let coerced = coerce_value(value, table.columns[col_idx].ty)?;
                 new_row[col_idx] = coerced;
             }
+            let row_index = table.rows.len();
             table.rows.push(new_row);
+            if let Some(partitioning) = &table.partitioning {
+                if let Some(value) = table.rows[row_index].get(partitioning.column_index) {
+                    if let Some(key) = partitioning.partition_key(value) {
+                        table.partitions.entry(key).or_default().push(row_index);
+                    }
+                }
+            }
             inserted += 1;
         }
         Ok(inserted)
@@ -162,7 +305,7 @@ impl SqlDatabase {
         &self,
         table_name: String,
         columns: SelectColumns,
-        predicate: Option<(String, Value)>,
+        predicate: Option<Predicate>,
     ) -> Result<QueryResult, SqlDatabaseError> {
         let table = self
             .tables
@@ -178,10 +321,64 @@ impl SqlDatabase {
         };
 
         let mut rows = Vec::new();
-        for row in &table.rows {
-            if let Some((column, value)) = &predicate {
-                let idx = self.column_index(table, column)?;
-                if !equal(&row[idx], value) {
+        let mut candidate_indices: Option<Vec<usize>> = None;
+        if let Some(predicate) = &predicate {
+            if let Some(partitioning) = &table.partitioning {
+                if partitioning.matches_column(predicate.column_name()) {
+                    match predicate {
+                        Predicate::Equals { value, .. } => {
+                            let idx = partitioning.column_index;
+                            let column_type = table.columns[idx].ty;
+                            let coerced = coerce_static_value(value, column_type)?;
+                            if let Some(key) = partitioning.partition_key(&coerced) {
+                                if let Some(part_rows) = table.partitions.get(&key) {
+                                    candidate_indices = Some(part_rows.clone());
+                                } else {
+                                    candidate_indices = Some(Vec::new());
+                                }
+                            } else {
+                                candidate_indices = Some(Vec::new());
+                            }
+                        }
+                        Predicate::Between { start, end, .. } => {
+                            let idx = partitioning.column_index;
+                            let column_type = table.columns[idx].ty;
+                            let start_val = coerce_static_value(start, column_type)?;
+                            let end_val = coerce_static_value(end, column_type)?;
+                            if let (Some(start_key), Some(end_key)) = (
+                                partitioning.partition_key(&start_val),
+                                partitioning.partition_key(&end_val),
+                            ) {
+                                let (lower, upper) = if start_key <= end_key {
+                                    (start_key, end_key)
+                                } else {
+                                    (end_key, start_key)
+                                };
+                                let mut indices = Vec::new();
+                                for rows in table
+                                    .partitions
+                                    .range((Included(lower), Included(upper)))
+                                    .map(|(_, v)| v)
+                                {
+                                    indices.extend(rows.iter().copied());
+                                }
+                                candidate_indices = Some(indices);
+                            } else {
+                                candidate_indices = Some(Vec::new());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let iter: Box<dyn Iterator<Item = usize>> = match candidate_indices {
+            Some(indices) => Box::new(indices.into_iter()),
+            None => Box::new(0..table.rows.len()),
+        };
+        for row_index in iter {
+            let row = &table.rows[row_index];
+            if let Some(predicate) = &predicate {
+                if !self.evaluate_predicate(table, predicate, row)? {
                     continue;
                 }
             }
@@ -199,6 +396,161 @@ impl SqlDatabase {
         })
     }
 
+    fn exec_create_graph(&mut self, name: String) -> Result<(), SqlDatabaseError> {
+        if self.graphs.contains_key(&name) {
+            return Err(SqlDatabaseError::GraphExists(name));
+        }
+        self.graphs.insert(name, Graph::default());
+        Ok(())
+    }
+
+    fn exec_create_node(
+        &mut self,
+        graph: String,
+        id: String,
+        properties: HashMap<String, Value>,
+    ) -> Result<(), SqlDatabaseError> {
+        let graph_entry = self
+            .graphs
+            .get_mut(&graph)
+            .ok_or_else(|| SqlDatabaseError::UnknownGraph(graph.clone()))?;
+        if graph_entry.nodes.contains_key(&id) {
+            return Err(SqlDatabaseError::NodeExists(graph, id));
+        }
+        graph_entry
+            .nodes
+            .insert(id.clone(), GraphNode { id, properties });
+        Ok(())
+    }
+
+    fn exec_create_edge(
+        &mut self,
+        graph: String,
+        from: String,
+        to: String,
+        label: Option<String>,
+        properties: HashMap<String, Value>,
+    ) -> Result<(), SqlDatabaseError> {
+        let graph_entry = self
+            .graphs
+            .get_mut(&graph)
+            .ok_or_else(|| SqlDatabaseError::UnknownGraph(graph.clone()))?;
+        if !graph_entry.nodes.contains_key(&from) {
+            return Err(SqlDatabaseError::UnknownGraphNode(graph.clone(), from));
+        }
+        if !graph_entry.nodes.contains_key(&to) {
+            return Err(SqlDatabaseError::UnknownGraphNode(graph.clone(), to));
+        }
+        graph_entry.edges.push(GraphEdge {
+            from,
+            to,
+            label,
+            properties,
+        });
+        Ok(())
+    }
+
+    fn exec_match_graph(
+        &self,
+        graph: String,
+        from: Option<String>,
+        to: Option<String>,
+        label: Option<String>,
+        property_filter: Option<HashMap<String, Value>>,
+    ) -> Result<QueryResult, SqlDatabaseError> {
+        let graph_entry = self
+            .graphs
+            .get(&graph)
+            .ok_or_else(|| SqlDatabaseError::UnknownGraph(graph.clone()))?;
+        let mut rows = Vec::new();
+        for edge in &graph_entry.edges {
+            if let Some(from_id) = &from {
+                if !edge.from.eq_ignore_ascii_case(from_id) {
+                    continue;
+                }
+            }
+            if let Some(to_id) = &to {
+                if !edge.to.eq_ignore_ascii_case(to_id) {
+                    continue;
+                }
+            }
+            if let Some(label_filter) = &label {
+                match &edge.label {
+                    Some(edge_label) if edge_label.eq_ignore_ascii_case(label_filter) => {}
+                    _ => continue,
+                }
+            }
+            if let Some(filter) = &property_filter {
+                let mut matches = true;
+                for (key, value) in filter {
+                    match edge.properties.get(key) {
+                        Some(existing) if equal(existing, value) => {}
+                        _ => {
+                            matches = false;
+                            break;
+                        }
+                    }
+                }
+                if !matches {
+                    continue;
+                }
+            }
+            let mut row = Vec::new();
+            row.push(Value::Text(edge.from.clone()));
+            row.push(Value::Text(edge.to.clone()));
+            row.push(match &edge.label {
+                Some(label) => Value::Text(label.clone()),
+                None => Value::Null,
+            });
+            row.push(Value::Text(format_properties(&edge.properties)));
+            rows.push(row);
+        }
+        Ok(QueryResult::Rows {
+            columns: vec![
+                "from".into(),
+                "to".into(),
+                "label".into(),
+                "properties".into(),
+            ],
+            rows,
+        })
+    }
+
+    fn evaluate_predicate(
+        &self,
+        table: &Table,
+        predicate: &Predicate,
+        row: &[Value],
+    ) -> Result<bool, SqlDatabaseError> {
+        match predicate {
+            Predicate::Equals { column, value } => {
+                let idx = self.column_index(table, column)?;
+                let column_type = table.columns[idx].ty;
+                let coerced = coerce_static_value(value, column_type)?;
+                Ok(equal(&row[idx], &coerced))
+            }
+            Predicate::Between { column, start, end } => {
+                let idx = self.column_index(table, column)?;
+                if matches!(row[idx], Value::Null) {
+                    return Ok(false);
+                }
+                let column_type = table.columns[idx].ty;
+                let start_val = coerce_static_value(start, column_type)?;
+                let end_val = coerce_static_value(end, column_type)?;
+                let (low, high) = match compare_values(&start_val, &end_val) {
+                    Some(Ordering::Greater) => (&end_val, &start_val),
+                    _ => (&start_val, &end_val),
+                };
+                let cmp_low = compare_values(&row[idx], low);
+                let cmp_high = compare_values(&row[idx], high);
+                Ok(
+                    matches!(cmp_low, Some(Ordering::Greater) | Some(Ordering::Equal))
+                        && matches!(cmp_high, Some(Ordering::Less) | Some(Ordering::Equal)),
+                )
+            }
+        }
+    }
+
     fn column_index(&self, table: &Table, name: &str) -> Result<usize, SqlDatabaseError> {
         table
             .columns
@@ -213,6 +565,7 @@ enum Statement {
     CreateTable {
         name: String,
         columns: Vec<(String, ColumnType)>,
+        partitioning: Option<PartitioningInfo>,
     },
     Insert {
         table: String,
@@ -222,7 +575,29 @@ enum Statement {
     Select {
         table: String,
         columns: SelectColumns,
-        predicate: Option<(String, Value)>,
+        predicate: Option<Predicate>,
+    },
+    CreateGraph {
+        name: String,
+    },
+    CreateNode {
+        graph: String,
+        id: String,
+        properties: HashMap<String, Value>,
+    },
+    CreateEdge {
+        graph: String,
+        from: String,
+        to: String,
+        label: Option<String>,
+        properties: HashMap<String, Value>,
+    },
+    MatchGraph {
+        graph: String,
+        from: Option<String>,
+        to: Option<String>,
+        label: Option<String>,
+        property_filter: Option<HashMap<String, Value>>,
     },
 }
 
@@ -232,6 +607,28 @@ enum SelectColumns {
     Some(Vec<String>),
 }
 
+#[derive(Debug, Clone)]
+enum Predicate {
+    Equals {
+        column: String,
+        value: Value,
+    },
+    Between {
+        column: String,
+        start: Value,
+        end: Value,
+    },
+}
+
+impl Predicate {
+    fn column_name(&self) -> &str {
+        match self {
+            Predicate::Equals { column, .. } => column,
+            Predicate::Between { column, .. } => column,
+        }
+    }
+}
+
 fn parse_statement(sql: &str) -> Result<Statement, SqlDatabaseError> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
@@ -239,13 +636,28 @@ fn parse_statement(sql: &str) -> Result<Statement, SqlDatabaseError> {
     }
     let trimmed = trimmed.trim_end_matches(';').trim();
     if let Some(rest) = strip_keyword_ci(trimmed, "CREATE") {
-        let rest = expect_keyword_ci(rest, "TABLE")?;
-        parse_create_table(rest)
+        let rest = rest.trim_start();
+        if let Some(rest) = strip_keyword_ci(rest, "TABLE") {
+            parse_create_table(rest)
+        } else if let Some(rest) = strip_keyword_ci(rest, "GRAPH") {
+            parse_create_graph(rest)
+        } else if let Some(rest) = strip_keyword_ci(rest, "NODE") {
+            parse_create_node(rest)
+        } else if let Some(rest) = strip_keyword_ci(rest, "EDGE") {
+            parse_create_edge(rest)
+        } else {
+            Err(SqlDatabaseError::Parse(
+                "unsupported CREATE statement".into(),
+            ))
+        }
     } else if let Some(rest) = strip_keyword_ci(trimmed, "INSERT") {
         let rest = expect_keyword_ci(rest, "INTO")?;
         parse_insert(rest)
     } else if let Some(rest) = strip_keyword_ci(trimmed, "SELECT") {
         parse_select(rest)
+    } else if let Some(rest) = strip_keyword_ci(trimmed, "MATCH") {
+        let rest = expect_keyword_ci(rest, "GRAPH")?;
+        parse_match_graph(rest)
     } else {
         Err(SqlDatabaseError::Unsupported)
     }
@@ -254,7 +666,6 @@ fn parse_statement(sql: &str) -> Result<Statement, SqlDatabaseError> {
 fn parse_create_table(input: &str) -> Result<Statement, SqlDatabaseError> {
     let (name, rest) = parse_identifier(input)?;
     let (columns_raw, remainder) = take_parenthesized(rest)?;
-    ensure_no_trailing_tokens(remainder)?;
     let parts = split_comma(&columns_raw)?;
     let mut columns = Vec::new();
     for part in parts {
@@ -273,7 +684,19 @@ fn parse_create_table(input: &str) -> Result<Statement, SqlDatabaseError> {
         let ty = parse_column_type(ty)?;
         columns.push((name.to_string(), ty));
     }
-    Ok(Statement::CreateTable { name, columns })
+    let mut partitioning = None;
+    let mut remainder_trimmed = remainder.trim_start();
+    if !remainder_trimmed.is_empty() {
+        let (info, rest) = parse_partitioning_clause(remainder_trimmed)?;
+        partitioning = Some(info);
+        remainder_trimmed = rest.trim_start();
+    }
+    ensure_no_trailing_tokens(remainder_trimmed)?;
+    Ok(Statement::CreateTable {
+        name,
+        columns,
+        partitioning,
+    })
 }
 
 fn parse_insert(input: &str) -> Result<Statement, SqlDatabaseError> {
@@ -314,6 +737,264 @@ fn parse_insert(input: &str) -> Result<Statement, SqlDatabaseError> {
     })
 }
 
+fn parse_partitioning_clause(input: &str) -> Result<(PartitioningInfo, &str), SqlDatabaseError> {
+    let rest = expect_keyword_ci(input, "PARTITION")?;
+    let rest = expect_keyword_ci(rest, "BY")?;
+    let rest = rest.trim_start();
+    if let Some(rest) = strip_keyword_ci(rest, "DAY") {
+        let (column_raw, remainder) = take_parenthesized(rest)?;
+        let column = column_raw.trim();
+        if column.is_empty() {
+            return Err(SqlDatabaseError::Parse(
+                "PARTITION BY DAY requires a column name".into(),
+            ));
+        }
+        if column.contains(',') {
+            return Err(SqlDatabaseError::Parse(
+                "only a single column can be used for time partitioning".into(),
+            ));
+        }
+        Ok((
+            PartitioningInfo {
+                column: column.to_string(),
+                granularity: PartitionGranularity::Day,
+            },
+            remainder,
+        ))
+    } else {
+        Err(SqlDatabaseError::Parse(
+            "unsupported time partition granularity".into(),
+        ))
+    }
+}
+
+fn parse_literal_token(input: &str) -> Result<(Value, &str), SqlDatabaseError> {
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() {
+        return Err(SqlDatabaseError::Parse("missing literal".into()));
+    }
+    if trimmed.starts_with('\'') {
+        let mut escaped = false;
+        for (idx, byte) in trimmed.as_bytes().iter().enumerate().skip(1) {
+            let ch = *byte as char;
+            if ch == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if ch == '\'' && !escaped {
+                let token = &trimmed[..=idx];
+                let rest = &trimmed[idx + 1..];
+                let value = parse_value(token)?;
+                return Ok((value, rest));
+            }
+            escaped = false;
+        }
+        Err(SqlDatabaseError::Parse(
+            "unterminated string literal".into(),
+        ))
+    } else if trimmed.starts_with('"') {
+        for (idx, byte) in trimmed.as_bytes().iter().enumerate().skip(1) {
+            let ch = *byte as char;
+            if ch == '"' {
+                let token = &trimmed[..=idx];
+                let rest = &trimmed[idx + 1..];
+                let value = parse_value(token)?;
+                return Ok((value, rest));
+            }
+        }
+        Err(SqlDatabaseError::Parse(
+            "unterminated string literal".into(),
+        ))
+    } else {
+        let mut end = trimmed.len();
+        for (idx, ch) in trimmed.char_indices() {
+            if ch.is_whitespace() {
+                end = idx;
+                break;
+            }
+        }
+        let token = &trimmed[..end];
+        let rest = &trimmed[end..];
+        let value = parse_value(token)?;
+        Ok((value, rest))
+    }
+}
+
+fn parse_properties_clause(
+    input: &str,
+) -> Result<(HashMap<String, Value>, &str), SqlDatabaseError> {
+    let rest = expect_keyword_ci(input, "WITH")?;
+    let rest = expect_keyword_ci(rest, "PROPERTIES")?;
+    let (raw, remainder) = take_parenthesized(rest)?;
+    let props = parse_properties_map(&raw)?;
+    Ok((props, remainder))
+}
+
+fn parse_properties_map(raw: &str) -> Result<HashMap<String, Value>, SqlDatabaseError> {
+    let mut props = HashMap::new();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(props);
+    }
+    for part in split_comma(trimmed)? {
+        let (key, value_str) = part
+            .split_once('=')
+            .ok_or_else(|| SqlDatabaseError::Parse("invalid property assignment".into()))?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(SqlDatabaseError::Parse(
+                "property keys cannot be empty".into(),
+            ));
+        }
+        let value = parse_value(value_str.trim())?;
+        props.insert(key.to_string(), value);
+    }
+    Ok(props)
+}
+
+fn value_to_string(value: Value, context: &str) -> Result<String, SqlDatabaseError> {
+    match value {
+        Value::Text(s) => Ok(s),
+        Value::Integer(i) => Ok(i.to_string()),
+        Value::Float(f) => Ok(f.to_string()),
+        Value::Boolean(b) => Ok(b.to_string()),
+        Value::Timestamp(ts) => Ok(ts.to_rfc3339()),
+        Value::Null => Err(SqlDatabaseError::Parse(
+            format!("{context} cannot be NULL",),
+        )),
+    }
+}
+
+fn parse_create_graph(input: &str) -> Result<Statement, SqlDatabaseError> {
+    let (name, rest) = parse_identifier(input)?;
+    ensure_no_trailing_tokens(rest)?;
+    Ok(Statement::CreateGraph { name })
+}
+
+fn parse_create_node(input: &str) -> Result<Statement, SqlDatabaseError> {
+    let (graph, rest) = parse_identifier(input)?;
+    let (id_value, mut remainder) = {
+        let rest = expect_keyword_ci(rest, "ID")?;
+        parse_literal_token(rest)?
+    };
+    let id = value_to_string(id_value, "node id")?;
+    let mut properties = HashMap::new();
+    remainder = remainder.trim_start();
+    if !remainder.is_empty() {
+        let (props, rest) = parse_properties_clause(remainder)?;
+        properties = props;
+        remainder = rest;
+    }
+    ensure_no_trailing_tokens(remainder)?;
+    Ok(Statement::CreateNode {
+        graph,
+        id,
+        properties,
+    })
+}
+
+fn parse_create_edge(input: &str) -> Result<Statement, SqlDatabaseError> {
+    let (graph, rest) = parse_identifier(input)?;
+    let rest = expect_keyword_ci(rest, "FROM")?;
+    let (from_value, rest) = parse_literal_token(rest)?;
+    let from = value_to_string(from_value, "edge source")?;
+    let rest = expect_keyword_ci(rest, "TO")?;
+    let (to_value, mut remainder) = parse_literal_token(rest)?;
+    let to = value_to_string(to_value, "edge target")?;
+    let mut label = None;
+    remainder = remainder.trim_start();
+    if let Some(rest) = strip_keyword_ci(remainder, "LABEL") {
+        let (label_value, rest_after) = parse_literal_token(rest)?;
+        label = Some(value_to_string(label_value, "edge label")?);
+        remainder = rest_after;
+    }
+    remainder = remainder.trim_start();
+    let mut properties = HashMap::new();
+    if !remainder.is_empty() {
+        let (props, rest_after) = parse_properties_clause(remainder)?;
+        properties = props;
+        remainder = rest_after;
+    }
+    ensure_no_trailing_tokens(remainder)?;
+    Ok(Statement::CreateEdge {
+        graph,
+        from,
+        to,
+        label,
+        properties,
+    })
+}
+
+fn parse_match_graph(input: &str) -> Result<Statement, SqlDatabaseError> {
+    let (graph, mut remainder) = parse_identifier(input)?;
+    let mut from = None;
+    let mut to = None;
+    let mut label = None;
+    let mut property_filter = None;
+    loop {
+        let trimmed = remainder.trim_start();
+        if trimmed.is_empty() {
+            remainder = trimmed;
+            break;
+        }
+        if let Some(rest) = strip_keyword_ci(trimmed, "FROM") {
+            if from.is_some() {
+                return Err(SqlDatabaseError::Parse(
+                    "FROM clause specified multiple times".into(),
+                ));
+            }
+            let (value, rest_after) = parse_literal_token(rest)?;
+            from = Some(value_to_string(value, "match source")?);
+            remainder = rest_after;
+            continue;
+        }
+        if let Some(rest) = strip_keyword_ci(trimmed, "TO") {
+            if to.is_some() {
+                return Err(SqlDatabaseError::Parse(
+                    "TO clause specified multiple times".into(),
+                ));
+            }
+            let (value, rest_after) = parse_literal_token(rest)?;
+            to = Some(value_to_string(value, "match destination")?);
+            remainder = rest_after;
+            continue;
+        }
+        if let Some(rest) = strip_keyword_ci(trimmed, "LABEL") {
+            if label.is_some() {
+                return Err(SqlDatabaseError::Parse(
+                    "LABEL clause specified multiple times".into(),
+                ));
+            }
+            let (value, rest_after) = parse_literal_token(rest)?;
+            label = Some(value_to_string(value, "match label")?);
+            remainder = rest_after;
+            continue;
+        }
+        if let Some(_) = strip_keyword_ci(trimmed, "WITH") {
+            if property_filter.is_some() {
+                return Err(SqlDatabaseError::Parse(
+                    "properties filter specified multiple times".into(),
+                ));
+            }
+            let (props, rest_after) = parse_properties_clause(trimmed)?;
+            property_filter = Some(props);
+            remainder = rest_after;
+            continue;
+        }
+        return Err(SqlDatabaseError::Parse(
+            "unexpected token in MATCH GRAPH statement".into(),
+        ));
+    }
+    ensure_no_trailing_tokens(remainder)?;
+    Ok(Statement::MatchGraph {
+        graph,
+        from,
+        to,
+        label,
+        property_filter,
+    })
+}
+
 fn parse_select(input: &str) -> Result<Statement, SqlDatabaseError> {
     let (columns_raw, rest) = split_keyword_ci(input, "FROM")
         .ok_or_else(|| SqlDatabaseError::Parse("missing FROM clause".into()))?;
@@ -335,19 +1016,22 @@ fn parse_select(input: &str) -> Result<Statement, SqlDatabaseError> {
         let rest = expect_keyword_ci(remainder, "WHERE")?;
         let (column, rest) = parse_identifier(rest)?;
         let rest = rest.trim_start();
-        if !rest.starts_with('=') {
-            return Err(SqlDatabaseError::Parse(
-                "expected '=' in WHERE clause".into(),
-            ));
+        if let Some(rest) = strip_keyword_ci(rest, "BETWEEN") {
+            let (start, rest) = parse_literal_token(rest)?;
+            let rest = expect_keyword_ci(rest, "AND")?;
+            let (end, rest) = parse_literal_token(rest)?;
+            ensure_no_trailing_tokens(rest)?;
+            Some(Predicate::Between { column, start, end })
+        } else {
+            if !rest.starts_with('=') {
+                return Err(SqlDatabaseError::Parse(
+                    "expected '=' in WHERE clause".into(),
+                ));
+            }
+            let (value, rest) = parse_literal_token(&rest[1..])?;
+            ensure_no_trailing_tokens(rest)?;
+            Some(Predicate::Equals { column, value })
         }
-        let value_str = rest[1..].trim();
-        if value_str.is_empty() {
-            return Err(SqlDatabaseError::Parse(
-                "missing literal in WHERE clause".into(),
-            ));
-        }
-        let value = parse_value(value_str)?;
-        Some((column, value))
     };
     Ok(Statement::Select {
         table,
@@ -362,6 +1046,7 @@ fn parse_column_type(input: &str) -> Result<ColumnType, SqlDatabaseError> {
         "FLOAT" | "REAL" | "DOUBLE" | "NUMERIC" | "DECIMAL" => Ok(ColumnType::Float),
         "TEXT" | "STRING" | "VARCHAR" | "CHAR" => Ok(ColumnType::Text),
         "BOOL" | "BOOLEAN" => Ok(ColumnType::Boolean),
+        "TIMESTAMP" | "DATETIME" => Ok(ColumnType::Timestamp),
         other => Err(SqlDatabaseError::Parse(format!(
             "unsupported column type '{other}'"
         ))),
@@ -556,6 +1241,20 @@ fn split_keyword_ci<'a>(input: &'a str, keyword: &str) -> Option<(String, &'a st
     None
 }
 
+fn compare_values(left: &Value, right: &Value) -> Option<Ordering> {
+    match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+        (Value::Integer(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+        (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
+        (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
+        (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+        (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
+
 fn coerce_value(value: Value, target: ColumnType) -> Result<Value, SqlDatabaseError> {
     match target {
         ColumnType::Integer => match value {
@@ -574,6 +1273,9 @@ fn coerce_value(value: Value, target: ColumnType) -> Result<Value, SqlDatabaseEr
             }),
             Value::Boolean(b) => Ok(Value::Integer(if b { 1 } else { 0 })),
             Value::Null => Ok(Value::Null),
+            Value::Timestamp(_) => Err(SqlDatabaseError::SchemaMismatch(
+                "cannot coerce TIMESTAMP to INTEGER".into(),
+            )),
         },
         ColumnType::Float => match value {
             Value::Integer(i) => Ok(Value::Float(i as f64)),
@@ -583,6 +1285,9 @@ fn coerce_value(value: Value, target: ColumnType) -> Result<Value, SqlDatabaseEr
             }),
             Value::Boolean(b) => Ok(Value::Float(if b { 1.0 } else { 0.0 })),
             Value::Null => Ok(Value::Null),
+            Value::Timestamp(_) => Err(SqlDatabaseError::SchemaMismatch(
+                "cannot coerce TIMESTAMP to FLOAT".into(),
+            )),
         },
         ColumnType::Text => match value {
             Value::Text(s) => Ok(Value::Text(s)),
@@ -590,6 +1295,7 @@ fn coerce_value(value: Value, target: ColumnType) -> Result<Value, SqlDatabaseEr
             Value::Float(f) => Ok(Value::Text(f.to_string())),
             Value::Boolean(b) => Ok(Value::Text(b.to_string())),
             Value::Null => Ok(Value::Null),
+            Value::Timestamp(ts) => Ok(Value::Text(ts.to_rfc3339())),
         },
         ColumnType::Boolean => match value {
             Value::Boolean(b) => Ok(Value::Boolean(b)),
@@ -603,8 +1309,39 @@ fn coerce_value(value: Value, target: ColumnType) -> Result<Value, SqlDatabaseEr
                 )),
             },
             Value::Null => Ok(Value::Null),
+            Value::Timestamp(_) => Err(SqlDatabaseError::SchemaMismatch(
+                "cannot coerce TIMESTAMP to BOOLEAN".into(),
+            )),
+        },
+        ColumnType::Timestamp => match value {
+            Value::Timestamp(ts) => Ok(Value::Timestamp(ts)),
+            Value::Text(s) => parse_timestamp_string(&s)
+                .map(Value::Timestamp)
+                .ok_or_else(|| {
+                    SqlDatabaseError::SchemaMismatch("failed to parse string as TIMESTAMP".into())
+                }),
+            Value::Integer(i) => timestamp_from_integer(i)
+                .map(Value::Timestamp)
+                .ok_or_else(|| {
+                    SqlDatabaseError::SchemaMismatch(
+                        "failed to convert integer to TIMESTAMP".into(),
+                    )
+                }),
+            Value::Float(f) => timestamp_from_float(f)
+                .map(Value::Timestamp)
+                .ok_or_else(|| {
+                    SqlDatabaseError::SchemaMismatch("failed to convert float to TIMESTAMP".into())
+                }),
+            Value::Boolean(_) => Err(SqlDatabaseError::SchemaMismatch(
+                "cannot coerce BOOLEAN to TIMESTAMP".into(),
+            )),
+            Value::Null => Ok(Value::Null),
         },
     }
+}
+
+fn coerce_static_value(value: &Value, target: ColumnType) -> Result<Value, SqlDatabaseError> {
+    coerce_value(value.clone(), target)
 }
 
 fn equal(left: &Value, right: &Value) -> bool {
@@ -640,7 +1377,81 @@ fn equal(left: &Value, right: &Value) -> bool {
             .parse::<f64>()
             .map(|v| (a - v).abs() < f64::EPSILON)
             .unwrap_or(false),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+        (Value::Timestamp(a), Value::Text(b)) => parse_timestamp_string(b)
+            .map(|parsed| parsed == *a)
+            .unwrap_or(false),
+        (Value::Text(a), Value::Timestamp(b)) => parse_timestamp_string(a)
+            .map(|parsed| parsed == *b)
+            .unwrap_or(false),
+        (Value::Timestamp(a), Value::Integer(b)) => timestamp_from_integer(*b)
+            .map(|parsed| parsed == *a)
+            .unwrap_or(false),
+        (Value::Integer(a), Value::Timestamp(b)) => timestamp_from_integer(*a)
+            .map(|parsed| parsed == *b)
+            .unwrap_or(false),
+        (Value::Timestamp(a), Value::Float(b)) => timestamp_from_float(*b)
+            .map(|parsed| parsed == *a)
+            .unwrap_or(false),
+        (Value::Float(a), Value::Timestamp(b)) => timestamp_from_float(*a)
+            .map(|parsed| parsed == *b)
+            .unwrap_or(false),
+        _ => false,
     }
+}
+
+fn format_properties(props: &HashMap<String, Value>) -> String {
+    if props.is_empty() {
+        return "{}".into();
+    }
+    let mut entries: Vec<_> = props.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let parts = entries
+        .into_iter()
+        .map(|(key, value)| format!("{key}: {}", format_value(value)))
+        .collect::<Vec<_>>();
+    format!("{{{}}}", parts.join(", "))
+}
+
+fn format_value(value: &Value) -> String {
+    match value {
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Text(s) => format!("\"{s}\""),
+        Value::Boolean(b) => b.to_string(),
+        Value::Timestamp(ts) => ts.to_rfc3339(),
+        Value::Null => "NULL".into(),
+    }
+}
+
+fn parse_timestamp_string(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
+        return Some(Utc.from_utc_datetime(&dt));
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(Utc.from_utc_datetime(&dt));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        if let Some(dt) = date.and_hms_opt(0, 0, 0) {
+            return Some(Utc.from_utc_datetime(&dt));
+        }
+    }
+    None
+}
+
+fn timestamp_from_integer(value: i64) -> Option<DateTime<Utc>> {
+    Utc.timestamp_opt(value, 0).single()
+}
+
+fn timestamp_from_float(value: f64) -> Option<DateTime<Utc>> {
+    if !value.is_finite() {
+        return None;
+    }
+    let seconds = value.trunc() as i64;
+    Utc.timestamp_opt(seconds, 0).single()
 }
 
 #[cfg(test)]
@@ -688,6 +1499,70 @@ mod tests {
                 assert_eq!(rows[0][0], Value::Text("latency".into()));
                 assert_eq!(rows[0][1], Value::Float(2.5));
                 assert_eq!(rows[0][2], Value::Null);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn time_series_partition_and_range_query() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE readings (ts TIMESTAMP, value INT) PARTITION BY DAY(ts);")
+            .unwrap();
+        db.execute("INSERT INTO readings VALUES ('2023-01-01T12:00:00Z', 10);")
+            .unwrap();
+        db.execute("INSERT INTO readings VALUES ('2023-01-02T08:00:00Z', 20);")
+            .unwrap();
+        db.execute("INSERT INTO readings VALUES ('2023-01-03T09:30:00Z', 30);")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT value FROM readings WHERE ts BETWEEN '2023-01-01T00:00:00Z' AND '2023-01-02T23:59:59Z';",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0], vec![Value::Integer(10)]);
+                assert_eq!(rows[1], vec![Value::Integer(20)]);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn graph_creation_and_matching() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE GRAPH social;").unwrap();
+        db.execute("CREATE NODE social ID 'alice' WITH PROPERTIES (role='admin');")
+            .unwrap();
+        db.execute("CREATE NODE social ID 'bob';").unwrap();
+        db.execute(
+            "CREATE EDGE social FROM 'alice' TO 'bob' LABEL 'FOLLOWS' WITH PROPERTIES (since='2023-01-01');",
+        )
+        .unwrap();
+
+        let result = db
+            .execute("MATCH GRAPH social FROM 'alice' LABEL 'FOLLOWS';")
+            .unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["from", "to", "label", "properties"]);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Text("alice".into()));
+                assert_eq!(rows[0][1], Value::Text("bob".into()));
+                assert_eq!(rows[0][2], Value::Text("FOLLOWS".into()));
+            }
+            _ => panic!("unexpected result"),
+        }
+
+        let filtered = db
+            .execute("MATCH GRAPH social FROM 'alice' WITH PROPERTIES (since='2023-01-01');")
+            .unwrap();
+        match filtered {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
             }
             _ => panic!("unexpected result"),
         }
