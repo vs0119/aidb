@@ -18,6 +18,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod sql;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 enum AnyIndex {
     Bruteforce(BruteForceIndex),
@@ -104,6 +106,14 @@ struct SearchReq {
     filter: Option<HashMap<String, JsonValue>>,
 }
 
+#[derive(Deserialize)]
+struct BatchSearchReq {
+    queries: Vec<Vector>,
+    top_k: usize,
+    #[allow(dead_code)]
+    filter: Option<HashMap<String, JsonValue>>,
+}
+
 #[derive(Serialize)]
 struct CreateCollectionResp {
     ok: bool,
@@ -124,6 +134,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/collections/:name/points", post(upsert_point))
         .route("/collections/:name/points:batch", post(upsert_points_batch))
         .route("/collections/:name/search", post(search_points))
+        .route("/collections/:name/search:batch", post(search_points_batch))
+        .route("/sql", post(exec_sql))
         .route("/collections/:name", get(collection_info))
         .route("/collections/:name/snapshot", post(snapshot_collection))
         .route("/collections/:name/compact", post(compact_collection))
@@ -178,6 +190,14 @@ async fn create_collection(
     State(state): State<AppState>,
     Json(req): Json<CreateCollectionReq>,
 ) -> Result<Json<CreateCollectionResp>, (StatusCode, String)> {
+    create_collection_internal(&state, req)?;
+    Ok(Json(CreateCollectionResp { ok: true }))
+}
+
+fn create_collection_internal(
+    state: &AppState,
+    req: CreateCollectionReq,
+) -> Result<(), (StatusCode, String)> {
     let metric = match req.metric.as_deref() {
         Some("cosine") | None => Metric::Cosine,
         Some("euclidean") => Metric::Euclidean,
@@ -211,7 +231,7 @@ async fn create_collection(
     };
     coll.recover().map_err(int_err)?;
     state.engine.insert_collection(coll);
-    Ok(Json(CreateCollectionResp { ok: true }))
+    Ok(())
 }
 
 async fn upsert_point(
@@ -219,16 +239,19 @@ async fn upsert_point(
     Path(name): Path<String>,
     Json(req): Json<UpsertPointReq>,
 ) -> Result<Json<Id>, (StatusCode, String)> {
-    let id = req.id.unwrap_or_else(Uuid::new_v4);
-    let coll = {
-        let map = state.engine.collections.read();
-        map.get(&name).cloned()
-    };
-    let Some(coll) = coll else {
-        return Err((StatusCode::NOT_FOUND, "collection not found".into()));
-    };
-    coll.upsert(id, req.vector, req.payload).map_err(int_err)?;
+    let id = upsert_point_internal(&state, &name, req)?;
     Ok(Json(id))
+}
+
+fn upsert_point_internal(
+    state: &AppState,
+    name: &str,
+    req: UpsertPointReq,
+) -> Result<Id, (StatusCode, String)> {
+    let id = req.id.unwrap_or_else(Uuid::new_v4);
+    let coll = get_collection(state, name)?;
+    coll.upsert(id, req.vector, req.payload).map_err(int_err)?;
+    Ok(id)
 }
 
 #[derive(Deserialize)]
@@ -241,17 +264,9 @@ async fn upsert_points_batch(
     Path(name): Path<String>,
     Json(req): Json<UpsertPointsBatchReq>,
 ) -> Result<Json<Vec<Id>>, (StatusCode, String)> {
-    let coll = {
-        let map = state.engine.collections.read();
-        map.get(&name).cloned()
-    };
-    let Some(coll) = coll else {
-        return Err((StatusCode::NOT_FOUND, "collection not found".into()));
-    };
     let mut ids = Vec::with_capacity(req.points.len());
     for p in req.points {
-        let id = p.id.unwrap_or_else(Uuid::new_v4);
-        coll.upsert(id, p.vector, p.payload).map_err(int_err)?;
+        let id = upsert_point_internal(&state, &name, p)?;
         ids.push(id);
     }
     Ok(Json(ids))
@@ -262,26 +277,9 @@ async fn search_points(
     Path(name): Path<String>,
     Json(req): Json<SearchReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let coll = {
-        let map = state.engine.collections.read();
-        map.get(&name).cloned()
-    };
-    let Some(coll) = coll else {
-        return Err((StatusCode::NOT_FOUND, "collection not found".into()));
-    };
-    let dim = coll.dim();
-    if req.vector.len() != dim {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "expected vector dimension {} but got {}",
-                dim,
-                req.vector.len()
-            ),
-        ));
-    }
+    let coll = get_collection(&state, &name)?;
     let filter = build_filter(&req.filter);
-    let res = coll.search(&req.vector, req.top_k, filter.as_ref());
+    let res = search_collection(&coll, &req.vector, req.top_k, filter)?;
     Ok(Json(serde_json::json!({ "results": res })))
 }
 
@@ -290,43 +288,30 @@ async fn search_points_batch(
     Path(name): Path<String>,
     Json(req): Json<BatchSearchReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let coll = {
-        let map = state.engine.collections.read();
-        map.get(&name).cloned()
-    };
-    let Some(coll) = coll else {
-        return Err((StatusCode::NOT_FOUND, "collection not found".into()));
-    };
-
-    let dim = coll.dim();
-    if let Some((idx, got)) = req
-        .queries
-        .iter()
-        .enumerate()
-        .find_map(|(i, q)| (q.len() != dim).then_some((i, q.len())))
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("query at index {idx} has dimension {got}, expected {dim}"),
-        ));
-    }
-
+    let coll = get_collection(&state, &name)?;
     let filter = build_filter(&req.filter);
-    let res = coll.search_many(&req.queries, req.top_k, filter.as_ref());
-    Ok(Json(serde_json::json!({ "results": res })))
+    let mut results = Vec::with_capacity(req.queries.len());
+    for (idx, query) in req.queries.iter().enumerate() {
+        if query.len() != coll.dim() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "query at index {idx} has dimension {}, expected {}",
+                    query.len(),
+                    coll.dim()
+                ),
+            ));
+        }
+        results.push(coll.search(query, req.top_k, filter.as_ref()));
+    }
+    Ok(Json(serde_json::json!({ "results": results })))
 }
 
 async fn delete_point(
     State(state): State<AppState>,
     Path((name, id)): Path<(String, Uuid)>,
 ) -> Result<Json<bool>, (StatusCode, String)> {
-    let coll = {
-        let map = state.engine.collections.read();
-        map.get(&name).cloned()
-    };
-    let Some(coll) = coll else {
-        return Err((StatusCode::NOT_FOUND, "collection not found".into()));
-    };
+    let coll = get_collection(&state, &name)?;
     let ok = coll.remove(id).map_err(int_err)?;
     Ok(Json(ok))
 }
@@ -346,13 +331,7 @@ async fn collection_info(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<CollectionInfoResp>, (StatusCode, String)> {
-    let coll = {
-        let map = state.engine.collections.read();
-        map.get(&name).cloned()
-    };
-    let Some(coll) = coll else {
-        return Err((StatusCode::NOT_FOUND, "collection not found".into()));
-    };
+    let coll = get_collection(&state, &name)?;
     let metric = match coll.metric() {
         Metric::Cosine => "cosine",
         Metric::Euclidean => "euclidean",
@@ -403,13 +382,7 @@ async fn snapshot_collection(
     Path(name): Path<String>,
     Json(req): Json<SnapshotReq>,
 ) -> Result<Json<bool>, (StatusCode, String)> {
-    let coll = {
-        let map = state.engine.collections.read();
-        map.get(&name).cloned()
-    };
-    let Some(coll) = coll else {
-        return Err((StatusCode::NOT_FOUND, "collection not found".into()));
-    };
+    let coll = get_collection(&state, &name)?;
     let path = req
         .path
         .unwrap_or_else(|| format!("./data/{}.snapshot", name));
@@ -431,13 +404,7 @@ async fn compact_collection(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<bool>, (StatusCode, String)> {
-    let coll = {
-        let map = state.engine.collections.read();
-        map.get(&name).cloned()
-    };
-    let Some(coll) = coll else {
-        return Err((StatusCode::NOT_FOUND, "collection not found".into()));
-    };
+    let coll = get_collection(&state, &name)?;
     let ok = coll.with_index_mut(|idx| match idx {
         AnyIndex::Hnsw(h) => {
             h.rebuild();
@@ -453,13 +420,7 @@ async fn update_params(
     Path(name): Path<String>,
     Json(req): Json<UpdateParamsReq>,
 ) -> Result<Json<bool>, (StatusCode, String)> {
-    let coll = {
-        let map = state.engine.collections.read();
-        map.get(&name).cloned()
-    };
-    let Some(coll) = coll else {
-        return Err((StatusCode::NOT_FOUND, "collection not found".into()));
-    };
+    let coll = get_collection(&state, &name)?;
     let ok = coll.with_index_mut(|idx| match idx {
         AnyIndex::Hnsw(h) => {
             if let Some(ef) = req.ef_search {
@@ -470,6 +431,120 @@ async fn update_params(
         AnyIndex::Bruteforce(_) => false,
     });
     Ok(Json(ok))
+}
+
+fn get_collection(
+    state: &AppState,
+    name: &str,
+) -> Result<Arc<Collection<AnyIndex>>, (StatusCode, String)> {
+    let map = state.engine.collections.read();
+    map.get(name)
+        .cloned()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "collection not found".into()))
+}
+
+fn build_filter(filter: &Option<HashMap<String, JsonValue>>) -> Option<MetadataFilter> {
+    filter.as_ref().and_then(|map| {
+        if map.is_empty() {
+            None
+        } else {
+            Some(MetadataFilter {
+                equals: map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            })
+        }
+    })
+}
+
+fn build_filter_owned(filter: Option<HashMap<String, JsonValue>>) -> Option<MetadataFilter> {
+    filter.and_then(|map| {
+        if map.is_empty() {
+            None
+        } else {
+            Some(MetadataFilter {
+                equals: map.into_iter().collect(),
+            })
+        }
+    })
+}
+
+fn search_collection(
+    coll: &Arc<Collection<AnyIndex>>,
+    vector: &[f32],
+    top_k: usize,
+    filter: Option<MetadataFilter>,
+) -> Result<Vec<aidb_core::SearchResult>, (StatusCode, String)> {
+    if vector.len() != coll.dim() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "expected vector dimension {} but got {}",
+                coll.dim(),
+                vector.len()
+            ),
+        ));
+    }
+    let filter_ref = filter.as_ref();
+    Ok(coll.search(vector, top_k, filter_ref))
+}
+
+#[derive(Deserialize)]
+struct SqlReq {
+    query: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SqlResp {
+    Create {
+        ok: bool,
+    },
+    Insert {
+        id: Id,
+    },
+    Search {
+        results: Vec<aidb_core::SearchResult>,
+    },
+}
+
+async fn exec_sql(
+    State(state): State<AppState>,
+    Json(req): Json<SqlReq>,
+) -> Result<Json<SqlResp>, (StatusCode, String)> {
+    let stmt = sql::parse(&req.query).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    match stmt {
+        sql::SqlStatement::CreateCollection(stmt) => {
+            let hnsw = stmt.hnsw.map(|h| HnswParamsReq {
+                m: h.m,
+                ef_construction: h.ef_construction,
+                ef_search: h.ef_search,
+            });
+            let req = CreateCollectionReq {
+                name: stmt.name,
+                dim: stmt.dim,
+                metric: stmt.metric,
+                wal_dir: stmt.wal_dir,
+                index: stmt.index,
+                hnsw,
+            };
+            create_collection_internal(&state, req)?;
+            Ok(Json(SqlResp::Create { ok: true }))
+        }
+        sql::SqlStatement::Insert(stmt) => {
+            let req = UpsertPointReq {
+                id: stmt.id,
+                vector: stmt.vector,
+                payload: stmt.payload,
+            };
+            let id = upsert_point_internal(&state, &stmt.collection, req)?;
+            Ok(Json(SqlResp::Insert { id }))
+        }
+        sql::SqlStatement::Search(stmt) => {
+            let coll = get_collection(&state, &stmt.collection)?;
+            let filter = build_filter_owned(stmt.filter);
+            let results = search_collection(&coll, &stmt.vector, stmt.top_k, filter)?;
+            Ok(Json(SqlResp::Search { results }))
+        }
+    }
 }
 
 #[cfg(test)]
