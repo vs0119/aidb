@@ -269,10 +269,50 @@ async fn search_points(
     let Some(coll) = coll else {
         return Err((StatusCode::NOT_FOUND, "collection not found".into()));
     };
-    let filter = req.filter.as_ref().map(|m| MetadataFilter {
-        equals: m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-    });
+    let dim = coll.dim();
+    if req.vector.len() != dim {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "expected vector dimension {} but got {}",
+                dim,
+                req.vector.len()
+            ),
+        ));
+    }
+    let filter = build_filter(&req.filter);
     let res = coll.search(&req.vector, req.top_k, filter.as_ref());
+    Ok(Json(serde_json::json!({ "results": res })))
+}
+
+async fn search_points_batch(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<BatchSearchReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let coll = {
+        let map = state.engine.collections.read();
+        map.get(&name).cloned()
+    };
+    let Some(coll) = coll else {
+        return Err((StatusCode::NOT_FOUND, "collection not found".into()));
+    };
+
+    let dim = coll.dim();
+    if let Some((idx, got)) = req
+        .queries
+        .iter()
+        .enumerate()
+        .find_map(|(i, q)| (q.len() != dim).then_some((i, q.len())))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("query at index {idx} has dimension {got}, expected {dim}"),
+        ));
+    }
+
+    let filter = build_filter(&req.filter);
+    let res = coll.search_many(&req.queries, req.top_k, filter.as_ref());
     Ok(Json(serde_json::json!({ "results": res })))
 }
 

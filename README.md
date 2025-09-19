@@ -62,6 +62,14 @@ cargo run -p aidb-bench --release -- --mode=http --report=csv --out=bench.csv
 ```json
 { "vector": [0.1, 0.2, ...], "top_k": 10, "filter": {"source": "a.txt"} }
 ```
+- `POST /collections/:name/search:batch` – batch vector search (single `top_k`/filter shared)
+```json
+{
+  "queries": [[0.1, 0.2, ...], [0.9, 0.1, ...]],
+  "top_k": 10,
+  "filter": {"source": "a.txt"}
+}
+```
 
 - `DELETE /collections/:name/points/:id` – delete a point
 
