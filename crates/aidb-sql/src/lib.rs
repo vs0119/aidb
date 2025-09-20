@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::Included;
 
 use chrono::Datelike;
@@ -32,7 +32,7 @@ enum ColumnType {
     Timestamp,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Table {
     columns: Vec<Column>,
     rows: Vec<Vec<Value>>,
@@ -313,13 +313,23 @@ impl SqlDatabase {
         select: &SelectStatement,
     ) -> Result<QueryResult, SqlDatabaseError> {
         if let Some(table) = cte_tables.get(&select.table) {
-            self.exec_select_from_table(table, &select.columns, select.predicate.as_ref())
+            self.exec_select_from_table(
+                table,
+                &select.columns,
+                select.predicate.as_ref(),
+                cte_tables,
+            )
         } else {
             let table = self
                 .tables
                 .get(&select.table)
                 .ok_or_else(|| SqlDatabaseError::UnknownTable(select.table.clone()))?;
-            self.exec_select_from_table(table, &select.columns, select.predicate.as_ref())
+            self.exec_select_from_table(
+                table,
+                &select.columns,
+                select.predicate.as_ref(),
+                cte_tables,
+            )
         }
     }
 
@@ -328,6 +338,7 @@ impl SqlDatabase {
         table: &Table,
         columns: &SelectColumns,
         predicate: Option<&Predicate>,
+        cte_tables: &HashMap<String, Table>,
     ) -> Result<QueryResult, SqlDatabaseError> {
         let mut candidate_indices: Option<Vec<usize>> = None;
         if let Some(predicate) = predicate {
@@ -375,6 +386,9 @@ impl SqlDatabase {
                                 candidate_indices = Some(Vec::new());
                             }
                         }
+                        Predicate::IsNull { .. }
+                        | Predicate::InTableColumn { .. }
+                        | Predicate::FullText { .. } => {}
                     }
                 }
             }
@@ -389,7 +403,7 @@ impl SqlDatabase {
         for row_index in iter {
             let row = &table.rows[row_index];
             if let Some(predicate) = predicate {
-                if !self.evaluate_predicate(table, predicate, row)? {
+                if !self.evaluate_predicate(table, predicate, row, cte_tables)? {
                     continue;
                 }
             }
@@ -484,10 +498,60 @@ impl SqlDatabase {
                     cte.name
                 )));
             }
-            let result = self.exec_select_statement(&tables, &cte.select)?;
-            let table = match result {
-                QueryResult::Rows { columns, rows } => table_from_rows(columns, rows),
-                _ => return Err(SqlDatabaseError::Unsupported),
+            let table = match &cte.body {
+                CteBody::NonRecursive(select) => {
+                    let result = self.exec_select_statement(&tables, select)?;
+                    match result {
+                        QueryResult::Rows { columns, rows } => table_from_rows(columns, rows),
+                        _ => return Err(SqlDatabaseError::Unsupported),
+                    }
+                }
+                CteBody::Recursive { anchor, recursive } => {
+                    let anchor_result = self.exec_select_statement(&tables, anchor)?;
+                    let (anchor_columns, anchor_rows) = match anchor_result {
+                        QueryResult::Rows { columns, rows } => (columns, rows),
+                        _ => return Err(SqlDatabaseError::Unsupported),
+                    };
+                    let column_names = anchor_columns.clone();
+                    let mut all_rows = anchor_rows;
+                    let mut seen: HashSet<String> = HashSet::new();
+                    for row in &all_rows {
+                        seen.insert(row_signature(row));
+                    }
+                    let mut working_table = table_from_rows(column_names.clone(), all_rows.clone());
+                    loop {
+                        let mut context = tables.clone();
+                        context.insert(cte.name.clone(), working_table.clone());
+                        let recursive_result = self.exec_select_statement(&context, recursive)?;
+                        let (rec_columns, rec_rows) = match recursive_result {
+                            QueryResult::Rows { columns, rows } => (columns, rows),
+                            _ => return Err(SqlDatabaseError::Unsupported),
+                        };
+                        if rec_columns.len() != column_names.len() {
+                            return Err(SqlDatabaseError::SchemaMismatch(
+                                "recursive CTE result column count mismatch".into(),
+                            ));
+                        }
+                        let mut added_new = false;
+                        for row in rec_rows {
+                            if row.len() != column_names.len() {
+                                return Err(SqlDatabaseError::SchemaMismatch(
+                                    "recursive CTE produced row with incorrect column count".into(),
+                                ));
+                            }
+                            let signature = row_signature(&row);
+                            if seen.insert(signature) {
+                                all_rows.push(row);
+                                added_new = true;
+                            }
+                        }
+                        if !added_new {
+                            break;
+                        }
+                        working_table = table_from_rows(column_names.clone(), all_rows.clone());
+                    }
+                    table_from_rows(column_names, all_rows)
+                }
             };
             tables.insert(cte.name.clone(), table);
         }
@@ -749,6 +813,7 @@ impl SqlDatabase {
         table: &Table,
         predicate: &Predicate,
         row: &[Value],
+        cte_tables: &HashMap<String, Table>,
     ) -> Result<bool, SqlDatabaseError> {
         match predicate {
             Predicate::Equals { column, value } => {
@@ -775,6 +840,50 @@ impl SqlDatabase {
                     matches!(cmp_low, Some(Ordering::Greater) | Some(Ordering::Equal))
                         && matches!(cmp_high, Some(Ordering::Less) | Some(Ordering::Equal)),
                 )
+            }
+            Predicate::IsNull { column } => {
+                let idx = self.column_index(table, column)?;
+                Ok(matches!(row[idx], Value::Null))
+            }
+            Predicate::InTableColumn {
+                column,
+                table: other_table,
+                table_column,
+            } => {
+                let idx = self.column_index(table, column)?;
+                if matches!(row[idx], Value::Null) {
+                    return Ok(false);
+                }
+                let value = &row[idx];
+                let lookup_table = if let Some(cte_table) = cte_tables.get(other_table) {
+                    cte_table
+                } else {
+                    self.tables
+                        .get(other_table)
+                        .ok_or_else(|| SqlDatabaseError::UnknownTable(other_table.clone()))?
+                };
+                let other_idx = lookup_table
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(table_column))
+                    .ok_or_else(|| SqlDatabaseError::UnknownColumn(table_column.clone()))?;
+                Ok(lookup_table
+                    .rows
+                    .iter()
+                    .any(|r| equal(&r[other_idx], value)))
+            }
+            Predicate::FullText {
+                column,
+                query,
+                language,
+            } => {
+                let idx = self.column_index(table, column)?;
+                if table.columns[idx].ty != ColumnType::Text {
+                    return Err(SqlDatabaseError::SchemaMismatch(format!(
+                        "column '{column}' must be TEXT for full-text search"
+                    )));
+                }
+                Ok(full_text_matches(&row[idx], query, language.as_deref()))
             }
         }
     }
@@ -859,7 +968,16 @@ struct SelectStatement {
 #[derive(Debug)]
 struct CommonTableExpression {
     name: String,
-    select: SelectStatement,
+    body: CteBody,
+}
+
+#[derive(Debug)]
+enum CteBody {
+    NonRecursive(SelectStatement),
+    Recursive {
+        anchor: SelectStatement,
+        recursive: SelectStatement,
+    },
 }
 
 #[derive(Debug)]
@@ -1029,6 +1147,19 @@ enum Predicate {
         start: Value,
         end: Value,
     },
+    IsNull {
+        column: String,
+    },
+    InTableColumn {
+        column: String,
+        table: String,
+        table_column: String,
+    },
+    FullText {
+        column: String,
+        query: String,
+        language: Option<String>,
+    },
 }
 
 impl Predicate {
@@ -1036,6 +1167,9 @@ impl Predicate {
         match self {
             Predicate::Equals { column, .. } => column,
             Predicate::Between { column, .. } => column,
+            Predicate::IsNull { column } => column,
+            Predicate::InTableColumn { column, .. } => column,
+            Predicate::FullText { column, .. } => column,
         }
     }
 }
@@ -1047,7 +1181,13 @@ fn parse_statement(sql: &str) -> Result<Statement, SqlDatabaseError> {
     }
     let trimmed = trimmed.trim_end_matches(';').trim();
     if let Some(rest) = strip_keyword_ci(trimmed, "WITH") {
-        let (ctes, remainder) = parse_common_table_expressions(rest)?;
+        let rest = rest.trim_start();
+        let (allow_recursive, rest) = if let Some(after) = strip_keyword_ci(rest, "RECURSIVE") {
+            (true, after)
+        } else {
+            (false, rest)
+        };
+        let (ctes, remainder) = parse_common_table_expressions(rest, allow_recursive)?;
         let remainder = remainder.trim_start();
         if let Some(rest_select) = strip_keyword_ci(remainder, "SELECT") {
             let select = parse_select_statement(rest_select)?;
@@ -1432,6 +1572,7 @@ fn parse_match_graph(input: &str) -> Result<Statement, SqlDatabaseError> {
 
 fn parse_common_table_expressions(
     input: &str,
+    allow_recursive: bool,
 ) -> Result<(Vec<CommonTableExpression>, &str), SqlDatabaseError> {
     let mut remainder = input;
     let mut ctes = Vec::new();
@@ -1446,14 +1587,26 @@ fn parse_common_table_expressions(
         }
         let (body, rest_after) = take_parenthesized(rest)?;
         let body_trimmed = body.trim();
-        let select = if let Some(select_body) = strip_keyword_ci(body_trimmed, "SELECT") {
-            parse_select_statement(select_body)?
+        let cte_body = if allow_recursive {
+            if let Some((anchor_raw, recursive_raw)) = split_recursive_union(body_trimmed) {
+                let anchor = parse_cte_select(&anchor_raw)?;
+                let recursive = parse_cte_select(&recursive_raw)?;
+                CteBody::Recursive { anchor, recursive }
+            } else {
+                CteBody::NonRecursive(parse_cte_select(body_trimmed)?)
+            }
         } else {
-            return Err(SqlDatabaseError::Parse(
-                "CTE body must be a SELECT statement".into(),
-            ));
+            if split_recursive_union(body_trimmed).is_some() {
+                return Err(SqlDatabaseError::Parse(
+                    "UNION ALL in CTE requires WITH RECURSIVE".into(),
+                ));
+            }
+            CteBody::NonRecursive(parse_cte_select(body_trimmed)?)
         };
-        ctes.push(CommonTableExpression { name, select });
+        ctes.push(CommonTableExpression {
+            name,
+            body: cte_body,
+        });
         remainder = rest_after.trim_start();
         if remainder.starts_with(',') {
             remainder = remainder[1..].trim_start();
@@ -1462,6 +1615,43 @@ fn parse_common_table_expressions(
         break;
     }
     Ok((ctes, remainder))
+}
+
+fn parse_cte_select(body: &str) -> Result<SelectStatement, SqlDatabaseError> {
+    if let Some(select_body) = strip_keyword_ci(body.trim(), "SELECT") {
+        parse_select_statement(select_body)
+    } else {
+        Err(SqlDatabaseError::Parse(
+            "CTE body must be a SELECT statement".into(),
+        ))
+    }
+}
+
+fn split_recursive_union(body: &str) -> Option<(String, String)> {
+    let lower = body.to_ascii_lowercase();
+    let mut search_start = 0usize;
+    while let Some(relative_idx) = lower[search_start..].find("union all") {
+        let idx = search_start + relative_idx;
+        let before = &body[..idx];
+        let mut depth = 0i32;
+        for ch in before.chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            let anchor = body[..idx].trim().to_string();
+            let recursive = body[idx + "union all".len()..].trim().to_string();
+            if anchor.is_empty() || recursive.is_empty() {
+                return None;
+            }
+            return Some((anchor, recursive));
+        }
+        search_start = idx + "union all".len();
+    }
+    None
 }
 
 fn parse_select_statement(input: &str) -> Result<SelectStatement, SqlDatabaseError> {
@@ -1483,22 +1673,69 @@ fn parse_select_statement(input: &str) -> Result<SelectStatement, SqlDatabaseErr
         None
     } else {
         let rest = expect_keyword_ci(remainder, "WHERE")?;
-        let (column, rest) = parse_identifier(rest)?;
-        let rest = rest.trim_start();
-        if let Some(rest) = strip_keyword_ci(rest, "BETWEEN") {
-            let (start, rest) = parse_literal_token(rest)?;
-            let rest = expect_keyword_ci(rest, "AND")?;
-            let (end, rest) = parse_literal_token(rest)?;
-            ensure_no_trailing_tokens(rest)?;
-            Some(Predicate::Between { column, start, end })
+        let (column, rest_after_column) = parse_identifier(rest)?;
+        let mut rest = rest_after_column.trim_start();
+        if let Some(after_between) = strip_keyword_ci(rest, "BETWEEN") {
+            let (start, rest_between) = parse_literal_token(after_between)?;
+            let rest_between = expect_keyword_ci(rest_between, "AND")?;
+            let (end, rest_final) = parse_literal_token(rest_between)?;
+            ensure_no_trailing_tokens(rest_final)?;
+            Some(Predicate::Between {
+                column: column.clone(),
+                start,
+                end,
+            })
+        } else if let Some(after_is) = strip_keyword_ci(rest, "IS") {
+            let rest_is = strip_keyword_ci(after_is, "NULL")
+                .ok_or_else(|| SqlDatabaseError::Parse("expected NULL after IS".into()))?;
+            ensure_no_trailing_tokens(rest_is)?;
+            Some(Predicate::IsNull {
+                column: column.clone(),
+            })
+        } else if let Some(after_in) = strip_keyword_ci(rest, "IN") {
+            let (other_table, rest_after_table) = parse_identifier(after_in)?;
+            let rest_after_table = rest_after_table.trim_start();
+            if !rest_after_table.starts_with('.') {
+                return Err(SqlDatabaseError::Parse(
+                    "expected '.' in IN table reference".into(),
+                ));
+            }
+            let (other_column, rest_after_column_name) = parse_identifier(&rest_after_table[1..])?;
+            ensure_no_trailing_tokens(rest_after_column_name)?;
+            Some(Predicate::InTableColumn {
+                column: column.clone(),
+                table: other_table,
+                table_column: other_column,
+            })
+        } else if rest.starts_with("@@") {
+            let (query_value, rest_after_query) = parse_literal_token(&rest[2..])?;
+            let query = value_to_string(query_value, "full-text query")?;
+            let remainder = rest_after_query.trim_start();
+            let mut language = None;
+            if !remainder.is_empty() {
+                let rest_after_lang_keyword = expect_keyword_ci(remainder, "LANGUAGE")?;
+                let (language_value, rest_after_language) =
+                    parse_literal_token(rest_after_lang_keyword)?;
+                let lang = value_to_string(language_value, "language specifier")?;
+                ensure_no_trailing_tokens(rest_after_language)?;
+                language = Some(lang);
+            } else {
+                ensure_no_trailing_tokens(remainder)?;
+            }
+            Some(Predicate::FullText {
+                column: column.clone(),
+                query,
+                language,
+            })
         } else {
+            rest = rest.trim_start();
             if !rest.starts_with('=') {
                 return Err(SqlDatabaseError::Parse(
                     "expected '=' in WHERE clause".into(),
                 ));
             }
-            let (value, rest) = parse_literal_token(&rest[1..])?;
-            ensure_no_trailing_tokens(rest)?;
+            let (value, rest_after_value) = parse_literal_token(&rest[1..])?;
+            ensure_no_trailing_tokens(rest_after_value)?;
             Some(Predicate::Equals { column, value })
         }
     };
@@ -1801,6 +2038,119 @@ fn rebuild_partitions(table: &mut Table) {
             }
         }
     }
+}
+
+fn row_signature(row: &[Value]) -> String {
+    let mut signature = String::new();
+    for value in row {
+        match value {
+            Value::Integer(i) => {
+                signature.push_str("i:");
+                signature.push_str(&i.to_string());
+            }
+            Value::Float(f) => {
+                signature.push_str("f:");
+                signature.push_str(&format!("{:.12}", f));
+            }
+            Value::Text(s) => {
+                signature.push_str("t:");
+                signature.push_str(s);
+            }
+            Value::Boolean(b) => {
+                signature.push_str("b:");
+                signature.push_str(if *b { "1" } else { "0" });
+            }
+            Value::Timestamp(ts) => {
+                signature.push_str("ts:");
+                signature.push_str(&ts.to_rfc3339());
+            }
+            Value::Null => {
+                signature.push_str("n:");
+            }
+        }
+        signature.push('|');
+    }
+    signature
+}
+
+fn full_text_matches(value: &Value, query: &str, language: Option<&str>) -> bool {
+    let document = match value {
+        Value::Text(text) => text,
+        _ => return false,
+    };
+    let doc_tokens = analyze_text(document, language);
+    if doc_tokens.is_empty() {
+        return false;
+    }
+    let query_tokens = analyze_text(query, language);
+    if query_tokens.is_empty() {
+        return false;
+    }
+    let doc_set: HashSet<String> = doc_tokens.into_iter().collect();
+    query_tokens
+        .into_iter()
+        .all(|token| doc_set.contains(&token))
+}
+
+fn analyze_text(text: &str, language: Option<&str>) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for part in text.split(|c: char| !c.is_alphanumeric()) {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        tokens.push(trimmed.to_lowercase());
+    }
+    match language {
+        Some(lang) if lang.eq_ignore_ascii_case("english") => {
+            tokens.into_iter().filter_map(apply_english_rules).collect()
+        }
+        Some(lang) if lang.eq_ignore_ascii_case("spanish") => {
+            tokens.into_iter().filter_map(apply_spanish_rules).collect()
+        }
+        _ => tokens,
+    }
+}
+
+fn apply_english_rules(token: String) -> Option<String> {
+    let stopwords = [
+        "the", "and", "or", "a", "an", "of", "to", "in", "on", "for", "with",
+    ];
+    if stopwords.iter().any(|&stop| stop == token) {
+        return None;
+    }
+    Some(stem_english(&token))
+}
+
+fn stem_english(token: &str) -> String {
+    if token.ends_with("ing") && token.len() > 4 {
+        return token[..token.len() - 3].to_string();
+    }
+    if token.ends_with("ed") && token.len() > 3 {
+        return token[..token.len() - 2].to_string();
+    }
+    if token.ends_with('s') && token.len() > 3 {
+        return token[..token.len() - 1].to_string();
+    }
+    token.to_string()
+}
+
+fn apply_spanish_rules(token: String) -> Option<String> {
+    let stopwords = ["el", "la", "los", "las", "y", "de", "del", "que"];
+    if stopwords.iter().any(|&stop| stop == token) {
+        return None;
+    }
+    Some(stem_spanish(&token))
+}
+
+fn stem_spanish(token: &str) -> String {
+    if token.ends_with("es") && token.len() > 4 {
+        return token[..token.len() - 2].to_string();
+    }
+    if token.ends_with('s') && token.len() > 4 {
+        return token[..token.len() - 1].to_string();
+    }
+    token.to_string()
 }
 
 fn evaluate_merge_value(
@@ -2683,6 +3033,103 @@ mod tests {
                     rows[1],
                     vec![Value::Integer(3), Value::Text("third".into())]
                 );
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn recursive_cte_traverses_hierarchy() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE categories (id INT, parent_id INT, name TEXT);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO categories VALUES (1, NULL, 'root'), (2, 1, 'child'), (3, 2, 'grandchild'), (4, NULL, 'standalone');",
+        )
+        .unwrap();
+
+        let result = db
+            .execute(
+                "WITH RECURSIVE tree AS (SELECT id, parent_id, name FROM categories WHERE parent_id IS NULL UNION ALL SELECT id, parent_id, name FROM categories WHERE parent_id IN tree.id) SELECT name FROM tree;",
+            )
+            .unwrap();
+
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name".to_string()]);
+                assert_eq!(rows.len(), 4);
+                let mut names = rows
+                    .into_iter()
+                    .map(|row| match row.into_iter().next().unwrap() {
+                        Value::Text(s) => s,
+                        other => panic!("unexpected value {other:?}"),
+                    })
+                    .collect::<Vec<_>>();
+                names.sort();
+                assert_eq!(names, vec!["child", "grandchild", "root", "standalone"]);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn full_text_search_basic() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE docs (id INT, content TEXT);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO docs VALUES (1, 'Rust systems programming'), (2, 'Distributed databases and storage');",
+        )
+        .unwrap();
+
+        let result = db
+            .execute("SELECT id FROM docs WHERE content @@ 'systems programming';")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Integer(1));
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn full_text_language_specific_analyzer() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE articles (id INT, content TEXT);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO articles VALUES (1, 'The future of systems design'), (2, 'Rust excels at systems work');",
+        )
+        .unwrap();
+
+        let default = db
+            .execute("SELECT id FROM articles WHERE content @@ 'the systems';")
+            .unwrap();
+        match default {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Integer(1));
+            }
+            _ => panic!("unexpected result"),
+        }
+
+        let english = db
+            .execute("SELECT id FROM articles WHERE content @@ 'the systems' LANGUAGE 'english';")
+            .unwrap();
+        match english {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                let mut ids = rows
+                    .into_iter()
+                    .map(|row| match row[0] {
+                        Value::Integer(id) => id,
+                        _ => panic!("unexpected id"),
+                    })
+                    .collect::<Vec<_>>();
+                ids.sort();
+                assert_eq!(ids, vec![1, 2]);
             }
             _ => panic!("unexpected result"),
         }
