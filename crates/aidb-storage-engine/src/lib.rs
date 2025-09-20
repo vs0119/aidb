@@ -7,12 +7,14 @@ use thiserror::Error;
 
 pub mod buffer;
 pub mod compression;
+pub mod distributed;
 pub mod page;
 pub mod transaction;
 pub mod vacuum;
 
 pub use buffer::*;
 pub use compression::*;
+pub use distributed::*;
 pub use page::*;
 pub use transaction::*;
 pub use vacuum::*;
@@ -31,6 +33,8 @@ pub enum StorageEngineError {
     InvalidPageRef(PageId),
     #[error("compression error: {0}")]
     CompressionError(String),
+    #[error("distributed transaction error: {0}")]
+    DistributedTransaction(String),
 }
 
 pub type Result<T> = std::result::Result<T, StorageEngineError>;
@@ -121,8 +125,16 @@ pub struct EngineStats {
 
 impl StorageEngine {
     pub async fn new(data_dir: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::with_transaction_config(data_dir, transaction::TransactionManagerConfig::default())
+            .await
+    }
+
+    pub async fn with_transaction_config(
+        data_dir: impl AsRef<std::path::Path>,
+        config: transaction::TransactionManagerConfig,
+    ) -> Result<Self> {
         let buffer_pool = Arc::new(BufferPool::new(1024).await?);
-        let transaction_manager = Arc::new(TransactionManager::new());
+        let transaction_manager = Arc::new(TransactionManager::with_config(config));
         let page_manager = Arc::new(PageManager::new(data_dir).await?);
         let compression_manager = Arc::new(CompressionManager::new());
         let vacuum_manager = Arc::new(VacuumManager::new());
@@ -142,6 +154,13 @@ impl StorageEngine {
         self.transaction_manager.begin().await
     }
 
+    pub async fn begin_transaction_with_options(
+        &self,
+        options: transaction::TransactionOptions,
+    ) -> Result<Transaction> {
+        self.transaction_manager.begin_with_options(options).await
+    }
+
     pub async fn insert_vector(
         &self,
         txn: &Transaction,
@@ -152,6 +171,11 @@ impl StorageEngine {
         let row = VectorRow::new(id, vector, payload, txn.id);
 
         let page_id = self.page_manager.allocate_page().await?;
+        self.transaction_manager
+            .acquire_lock(txn, page_id, transaction::LockType::Exclusive)
+            .await?;
+        self.transaction_manager
+            .register_page_access(txn, page_id, transaction::AccessMode::Write);
         let page = self.buffer_pool.get_page(page_id).await?;
 
         let slot_id = page.write().await.insert_row(&row)?;
@@ -162,6 +186,14 @@ impl StorageEngine {
     }
 
     pub async fn get_vector(&self, txn: &Transaction, row_id: RowId) -> Result<Option<VectorRow>> {
+        self.transaction_manager
+            .acquire_lock(txn, row_id.page_id, transaction::LockType::Shared)
+            .await?;
+        self.transaction_manager.register_page_access(
+            txn,
+            row_id.page_id,
+            transaction::AccessMode::Read,
+        );
         let page = self.buffer_pool.get_page(row_id.page_id).await?;
         let page_guard = page.read().await;
 
@@ -183,6 +215,14 @@ impl StorageEngine {
         vector: Vector,
         payload: Option<JsonValue>,
     ) -> Result<()> {
+        self.transaction_manager
+            .acquire_lock(txn, row_id.page_id, transaction::LockType::Exclusive)
+            .await?;
+        self.transaction_manager.register_page_access(
+            txn,
+            row_id.page_id,
+            transaction::AccessMode::Write,
+        );
         let page = self.buffer_pool.get_page(row_id.page_id).await?;
         let mut page_guard = page.write().await;
 
@@ -205,6 +245,14 @@ impl StorageEngine {
     }
 
     pub async fn delete_vector(&self, txn: &Transaction, row_id: RowId) -> Result<bool> {
+        self.transaction_manager
+            .acquire_lock(txn, row_id.page_id, transaction::LockType::Exclusive)
+            .await?;
+        self.transaction_manager.register_page_access(
+            txn,
+            row_id.page_id,
+            transaction::AccessMode::Write,
+        );
         let page = self.buffer_pool.get_page(row_id.page_id).await?;
         let mut page_guard = page.write().await;
 
