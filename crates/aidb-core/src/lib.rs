@@ -1,3 +1,75 @@
+//! Core types and primitives for AIDB.
+//!
+//! The crate exposes vector types, distance metrics, and a trait that index
+//! implementations must satisfy. Most consumers will interact with the
+//! [`VectorIndex`] trait when embedding custom indexing strategies.
+//!
+//! # Examples
+//!
+//! ```
+//! use aidb_core::{Document, Id, Metric, SearchResult, VectorIndex};
+//!
+//! struct MemoryIndex {
+//!     dim: usize,
+//!     docs: Vec<Document>,
+//! }
+//!
+//! impl MemoryIndex {
+//!     fn new(dim: usize) -> Self {
+//!         Self { dim, docs: Vec::new() }
+//!     }
+//! }
+//!
+//! impl VectorIndex for MemoryIndex {
+//!     fn add(&mut self, id: Id, vector: Vec<f32>, payload: Option<aidb_core::JsonValue>) {
+//!         assert_eq!(vector.len(), self.dim);
+//!         self.docs.push(Document { id, vector, payload });
+//!     }
+//!
+//!     fn remove(&mut self, id: &Id) -> bool {
+//!         let before = self.docs.len();
+//!         self.docs.retain(|doc| &doc.id != id);
+//!         before != self.docs.len()
+//!     }
+//!
+//!     fn search(
+//!         &self,
+//!         vector: &[f32],
+//!         top_k: usize,
+//!         metric: Metric,
+//!         _filter: Option<&aidb_core::MetadataFilter>,
+//!     ) -> Vec<SearchResult> {
+//!         let mut results = self
+//!             .docs
+//!             .iter()
+//!             .map(|doc| SearchResult {
+//!                 id: doc.id,
+//!                 score: 1.0 - aidb_core::distance(&doc.vector, vector, metric),
+//!                 payload: doc.payload.clone(),
+//!             })
+//!             .collect::<Vec<_>>();
+//!         results.sort_by(|a, b| b.score.total_cmp(&a.score));
+//!         results.truncate(top_k);
+//!         results
+//!     }
+//!
+//!     fn len(&self) -> usize {
+//!         self.docs.len()
+//!     }
+//!
+//!     fn dim(&self) -> usize {
+//!         self.dim
+//!     }
+//! }
+//!
+//! let mut index = MemoryIndex::new(4);
+//! let doc_id = Id::new_v4();
+//! index.add(doc_id, vec![0.1, 0.2, 0.3, 0.4], None);
+//! let results = index.search(&[0.1, 0.2, 0.3, 0.4], 1, Metric::Cosine, None);
+//! assert_eq!(results.len(), 1);
+//! assert_eq!(results[0].id, doc_id);
+//! ```
+
 pub type Vector = Vec<f32>;
 
 pub use serde_json::Value as JsonValue;
@@ -107,4 +179,50 @@ pub fn l2(a: &[f32], b: &[f32]) -> f32 {
         s += d * d;
     }
     s.sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_filter_matches_empty() {
+        let filter = MetadataFilter::default();
+        assert!(filter.matches(&None));
+        assert!(filter.matches(&Some(JsonValue::Null)));
+    }
+
+    #[test]
+    fn metadata_filter_exact_match() {
+        let mut filter = MetadataFilter::default();
+        filter
+            .equals
+            .push(("kind".to_string(), JsonValue::String("doc".into())));
+        let payload = serde_json::json!({"kind": "doc", "title": "rust"});
+        assert!(filter.matches(&Some(payload)));
+    }
+
+    #[test]
+    fn metadata_filter_rejects_missing_keys() {
+        let mut filter = MetadataFilter::default();
+        filter
+            .equals
+            .push(("kind".to_string(), JsonValue::String("doc".into())));
+        let payload = serde_json::json!({"other": "value"});
+        assert!(!filter.matches(&Some(payload)));
+    }
+
+    #[test]
+    fn cosine_similarity_respects_zero_vectors() {
+        let a = vec![0.0, 0.0, 0.0];
+        let b = vec![1.0, 2.0, 3.0];
+        assert_eq!(cosine_sim(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn l2_distance_is_symmetric() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        assert!((l2(&a, &b) - l2(&b, &a)).abs() < f32::EPSILON);
+    }
 }
