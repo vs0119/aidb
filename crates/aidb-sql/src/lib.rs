@@ -312,15 +312,6 @@ impl SqlDatabase {
             .get(&table_name)
             .ok_or_else(|| SqlDatabaseError::UnknownTable(table_name.clone()))?;
 
-        let projection = match columns {
-            SelectColumns::All => (0..table.columns.len()).collect::<Vec<_>>(),
-            SelectColumns::Some(cols) => cols
-                .into_iter()
-                .map(|name| self.column_index(table, &name))
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-
-        let mut rows = Vec::new();
         let mut candidate_indices: Option<Vec<usize>> = None;
         if let Some(predicate) = &predicate {
             if let Some(partitioning) = &table.partitioning {
@@ -375,6 +366,7 @@ impl SqlDatabase {
             Some(indices) => Box::new(indices.into_iter()),
             None => Box::new(0..table.rows.len()),
         };
+        let mut matching_indices = Vec::new();
         for row_index in iter {
             let row = &table.rows[row_index];
             if let Some(predicate) = &predicate {
@@ -382,18 +374,83 @@ impl SqlDatabase {
                     continue;
                 }
             }
-            rows.push(projection.iter().map(|&idx| row[idx].clone()).collect());
+            matching_indices.push(row_index);
         }
 
-        let column_names = projection
-            .iter()
-            .map(|&idx| table.columns[idx].name.clone())
-            .collect();
+        match columns {
+            SelectColumns::All => {
+                let column_names = table.columns.iter().map(|c| c.name.clone()).collect();
+                let rows = matching_indices
+                    .into_iter()
+                    .map(|idx| table.rows[idx].clone())
+                    .collect();
+                Ok(QueryResult::Rows {
+                    columns: column_names,
+                    rows,
+                })
+            }
+            SelectColumns::Some(items) => {
+                let mut projections = Vec::new();
+                let mut window_specs = Vec::new();
 
-        Ok(QueryResult::Rows {
-            columns: column_names,
-            rows,
-        })
+                for item in items {
+                    match item {
+                        SelectItem::Column(name) => {
+                            let idx = self.column_index(table, &name)?;
+                            let output_name = table.columns[idx].name.clone();
+                            projections.push(PreparedProjection {
+                                output_name,
+                                kind: ProjectionKind::Column { index: idx },
+                            });
+                        }
+                        SelectItem::WindowFunction(spec) => {
+                            let window_index = window_specs.len();
+                            let output_name = spec
+                                .alias
+                                .clone()
+                                .unwrap_or_else(|| spec.function.default_alias().to_string());
+                            window_specs.push(spec);
+                            projections.push(PreparedProjection {
+                                output_name,
+                                kind: ProjectionKind::Window {
+                                    index: window_index,
+                                },
+                            });
+                        }
+                    }
+                }
+
+                let mut window_values = Vec::new();
+                for spec in &window_specs {
+                    let values = self.compute_window_function(table, &matching_indices, spec)?;
+                    window_values.push(values);
+                }
+
+                let mut rows = Vec::new();
+                for (position, &row_index) in matching_indices.iter().enumerate() {
+                    let row = &table.rows[row_index];
+                    let mut output_row = Vec::with_capacity(projections.len());
+                    for projection in &projections {
+                        match &projection.kind {
+                            ProjectionKind::Column { index } => {
+                                output_row.push(row[*index].clone());
+                            }
+                            ProjectionKind::Window { index } => {
+                                output_row.push(window_values[*index][position].clone());
+                            }
+                        }
+                    }
+                    rows.push(output_row);
+                }
+
+                let columns = projections
+                    .into_iter()
+                    .map(|projection| projection.output_name)
+                    .collect();
+
+                Ok(QueryResult::Rows { columns, rows })
+            }
+        }
     }
 
     fn exec_create_graph(&mut self, name: String) -> Result<(), SqlDatabaseError> {
@@ -551,6 +608,67 @@ impl SqlDatabase {
         }
     }
 
+    fn compute_window_function(
+        &self,
+        table: &Table,
+        row_indices: &[usize],
+        spec: &WindowFunctionExpr,
+    ) -> Result<Vec<Value>, SqlDatabaseError> {
+        match spec.function {
+            WindowFunctionType::RowNumber => self.compute_row_number(
+                table,
+                row_indices,
+                spec.partition_by.as_ref(),
+                &spec.order_by,
+            ),
+        }
+    }
+
+    fn compute_row_number(
+        &self,
+        table: &Table,
+        row_indices: &[usize],
+        partition_by: Option<&String>,
+        order_by: &str,
+    ) -> Result<Vec<Value>, SqlDatabaseError> {
+        let order_index = self.column_index(table, order_by)?;
+        let partition_index = match partition_by {
+            Some(column) => Some(self.column_index(table, column)?),
+            None => None,
+        };
+
+        let mut partitions: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        for (position, &row_index) in row_indices.iter().enumerate() {
+            let key = if let Some(part_idx) = partition_index {
+                partition_key_string(&table.rows[row_index][part_idx])
+            } else {
+                "__all__".to_string()
+            };
+            partitions
+                .entry(key)
+                .or_default()
+                .push((position, row_index));
+        }
+
+        let mut results = vec![Value::Null; row_indices.len()];
+        for group in partitions.values_mut() {
+            group.sort_by(|a, b| {
+                let left = &table.rows[a.1][order_index];
+                let right = &table.rows[b.1][order_index];
+                match compare_values(left, right) {
+                    Some(Ordering::Less) => Ordering::Less,
+                    Some(Ordering::Greater) => Ordering::Greater,
+                    Some(Ordering::Equal) | None => a.0.cmp(&b.0),
+                }
+            });
+            for (rank, (position, _)) in group.iter().enumerate() {
+                results[*position] = Value::Integer((rank + 1) as i64);
+            }
+        }
+
+        Ok(results)
+    }
+
     fn column_index(&self, table: &Table, name: &str) -> Result<usize, SqlDatabaseError> {
         table
             .columns
@@ -604,7 +722,46 @@ enum Statement {
 #[derive(Debug)]
 enum SelectColumns {
     All,
-    Some(Vec<String>),
+    Some(Vec<SelectItem>),
+}
+
+#[derive(Debug)]
+enum SelectItem {
+    Column(String),
+    WindowFunction(WindowFunctionExpr),
+}
+
+#[derive(Debug)]
+struct PreparedProjection {
+    output_name: String,
+    kind: ProjectionKind,
+}
+
+#[derive(Debug)]
+enum ProjectionKind {
+    Column { index: usize },
+    Window { index: usize },
+}
+
+#[derive(Debug, Clone)]
+struct WindowFunctionExpr {
+    function: WindowFunctionType,
+    partition_by: Option<String>,
+    order_by: String,
+    alias: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum WindowFunctionType {
+    RowNumber,
+}
+
+impl WindowFunctionType {
+    fn default_alias(&self) -> &'static str {
+        match self {
+            WindowFunctionType::RowNumber => "row_number",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1002,11 +1159,11 @@ fn parse_select(input: &str) -> Result<Statement, SqlDatabaseError> {
     let select_columns = if columns_raw == "*" {
         SelectColumns::All
     } else {
-        let cols = split_comma(columns_raw)?
-            .into_iter()
-            .map(|s| s.trim().to_string())
-            .collect();
-        SelectColumns::Some(cols)
+        let mut items = Vec::new();
+        for part in split_comma(columns_raw)? {
+            items.push(parse_select_item(&part)?);
+        }
+        SelectColumns::Some(items)
     };
     let (table, remainder) = parse_identifier(rest)?;
     let remainder = remainder.trim();
@@ -1038,6 +1195,96 @@ fn parse_select(input: &str) -> Result<Statement, SqlDatabaseError> {
         columns: select_columns,
         predicate,
     })
+}
+
+fn parse_select_item(input: &str) -> Result<SelectItem, SqlDatabaseError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(SqlDatabaseError::Parse("empty select item".into()));
+    }
+
+    if let Some(window) = parse_window_function(trimmed)? {
+        return Ok(SelectItem::WindowFunction(window));
+    }
+
+    if split_alias_keyword(trimmed).is_some() {
+        return Err(SqlDatabaseError::Parse(
+            "aliases are only supported for window functions".into(),
+        ));
+    }
+
+    let (column, rest) = parse_identifier(trimmed)?;
+    ensure_no_trailing_tokens(rest)?;
+    Ok(SelectItem::Column(column))
+}
+
+fn parse_window_function(input: &str) -> Result<Option<WindowFunctionExpr>, SqlDatabaseError> {
+    let mut alias = None;
+    let mut expression = input.trim().to_string();
+    if let Some((before, after)) = split_alias_keyword(input) {
+        let alias_part = after.trim_start();
+        if alias_part.is_empty() {
+            return Err(SqlDatabaseError::Parse("missing alias name".into()));
+        }
+        let (alias_ident, rest) = parse_identifier(alias_part)?;
+        ensure_no_trailing_tokens(rest)?;
+        alias = Some(alias_ident);
+        expression = before.trim_end().to_string();
+    }
+
+    if let Some(rest) = strip_keyword_ci(&expression, "ROW_NUMBER") {
+        let mut remainder = rest.trim_start();
+        if !remainder.starts_with('(') {
+            return Err(SqlDatabaseError::Parse(
+                "expected '()' after ROW_NUMBER".into(),
+            ));
+        }
+        remainder = remainder[1..].trim_start();
+        if !remainder.starts_with(')') {
+            return Err(SqlDatabaseError::Parse(
+                "ROW_NUMBER does not accept arguments".into(),
+            ));
+        }
+        remainder = &remainder[1..];
+        remainder = expect_keyword_ci(remainder, "OVER")?;
+        let remainder = remainder.trim_start();
+        let (window_raw, rest_after) = take_parenthesized(remainder)?;
+        ensure_no_trailing_tokens(rest_after)?;
+
+        let mut spec_remainder = window_raw.as_str();
+        spec_remainder = spec_remainder.trim_start();
+        if spec_remainder.is_empty() {
+            return Err(SqlDatabaseError::Parse(
+                "OVER clause requires ORDER BY".into(),
+            ));
+        }
+        let mut partition_by = None;
+        if let Some(rest) = strip_keyword_ci(spec_remainder, "PARTITION") {
+            let rest = expect_keyword_ci(rest, "BY")?;
+            let (column, rest_after) = parse_identifier(rest)?;
+            partition_by = Some(column);
+            spec_remainder = rest_after.trim_start();
+        }
+        let rest = expect_keyword_ci(spec_remainder, "ORDER")?;
+        let rest = expect_keyword_ci(rest, "BY")?;
+        let (order_by, rest_after) = parse_identifier(rest)?;
+        ensure_no_trailing_tokens(rest_after)?;
+
+        return Ok(Some(WindowFunctionExpr {
+            function: WindowFunctionType::RowNumber,
+            partition_by,
+            order_by,
+            alias,
+        }));
+    }
+
+    if alias.is_some() {
+        return Err(SqlDatabaseError::Parse(
+            "aliases are only supported for window functions".into(),
+        ));
+    }
+
+    Ok(None)
 }
 
 fn parse_column_type(input: &str) -> Result<ColumnType, SqlDatabaseError> {
@@ -1239,6 +1486,54 @@ fn split_keyword_ci<'a>(input: &'a str, keyword: &str) -> Option<(String, &'a st
         i += 1;
     }
     None
+}
+
+fn split_alias_keyword(input: &str) -> Option<(String, &str)> {
+    let mut in_string = false;
+    let mut depth = 0usize;
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        let ch = bytes[i] as char;
+        match ch {
+            '\'' => {
+                in_string = !in_string;
+                i += 1;
+                continue;
+            }
+            '(' if !in_string => depth += 1,
+            ')' if !in_string && depth > 0 => depth -= 1,
+            _ => {}
+        }
+        if !in_string && depth == 0 && input[i..i + 2].eq_ignore_ascii_case("AS") {
+            if i == 0 || !bytes[i - 1].is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            let after = &input[i + 2..];
+            if after
+                .chars()
+                .next()
+                .map(|c| c.is_whitespace())
+                .unwrap_or(false)
+            {
+                return Some((input[..i].to_string(), after));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn partition_key_string(value: &Value) -> String {
+    match value {
+        Value::Null => "__null__".to_string(),
+        Value::Integer(i) => format!("I:{i}"),
+        Value::Float(f) => format!("F:{f}"),
+        Value::Text(s) => format!("T:{s}"),
+        Value::Boolean(b) => format!("B:{b}"),
+        Value::Timestamp(ts) => format!("TS:{}", ts.to_rfc3339()),
+    }
 }
 
 fn compare_values(left: &Value, right: &Value) -> Option<Ordering> {
@@ -1597,6 +1892,71 @@ mod tests {
         match err {
             SqlDatabaseError::SchemaMismatch(_) => {}
             other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row_number_window_function_basic() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE metrics (id INT);").unwrap();
+        db.execute("INSERT INTO metrics VALUES (2), (1), (3);")
+            .unwrap();
+
+        let result = db
+            .execute("SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM metrics;")
+            .unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["id", "rn"]);
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0], vec![Value::Integer(2), Value::Integer(2)]);
+                assert_eq!(rows[1], vec![Value::Integer(1), Value::Integer(1)]);
+                assert_eq!(rows[2], vec![Value::Integer(3), Value::Integer(3)]);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn row_number_with_partitioning() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE sales (region TEXT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO sales VALUES ('east', 100), ('east', 50), ('west', 75);")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT region, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount) AS rn FROM sales;",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["region", "rn"]);
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0], vec![Value::Text("east".into()), Value::Integer(2)]);
+                assert_eq!(rows[1], vec![Value::Text("east".into()), Value::Integer(1)]);
+                assert_eq!(rows[2], vec![Value::Text("west".into()), Value::Integer(1)]);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn row_number_default_alias() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE items (id INT);").unwrap();
+        db.execute("INSERT INTO items VALUES (1);").unwrap();
+
+        let result = db
+            .execute("SELECT ROW_NUMBER() OVER (ORDER BY id) FROM items;")
+            .unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["row_number"]);
+                assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+            }
+            _ => panic!("unexpected result"),
         }
     }
 }
