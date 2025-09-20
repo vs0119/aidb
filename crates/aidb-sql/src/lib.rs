@@ -173,11 +173,8 @@ impl SqlDatabase {
                 let inserted = self.exec_insert(table, columns, rows)?;
                 Ok(QueryResult::Inserted(inserted))
             }
-            Statement::Select {
-                table,
-                columns,
-                predicate,
-            } => self.exec_select(table, columns, predicate),
+            Statement::Select { ctes, body } => self.exec_select(ctes, body),
+            Statement::Merge { ctes, merge } => self.exec_merge(ctes, merge),
             Statement::CreateGraph { name } => {
                 self.exec_create_graph(name)?;
                 Ok(QueryResult::None)
@@ -303,17 +300,37 @@ impl SqlDatabase {
 
     fn exec_select(
         &self,
-        table_name: String,
-        columns: SelectColumns,
-        predicate: Option<Predicate>,
+        ctes: Vec<CommonTableExpression>,
+        body: SelectStatement,
     ) -> Result<QueryResult, SqlDatabaseError> {
-        let table = self
-            .tables
-            .get(&table_name)
-            .ok_or_else(|| SqlDatabaseError::UnknownTable(table_name.clone()))?;
+        let cte_tables = self.materialize_ctes(&ctes)?;
+        self.exec_select_statement(&cte_tables, &body)
+    }
 
+    fn exec_select_statement(
+        &self,
+        cte_tables: &HashMap<String, Table>,
+        select: &SelectStatement,
+    ) -> Result<QueryResult, SqlDatabaseError> {
+        if let Some(table) = cte_tables.get(&select.table) {
+            self.exec_select_from_table(table, &select.columns, select.predicate.as_ref())
+        } else {
+            let table = self
+                .tables
+                .get(&select.table)
+                .ok_or_else(|| SqlDatabaseError::UnknownTable(select.table.clone()))?;
+            self.exec_select_from_table(table, &select.columns, select.predicate.as_ref())
+        }
+    }
+
+    fn exec_select_from_table(
+        &self,
+        table: &Table,
+        columns: &SelectColumns,
+        predicate: Option<&Predicate>,
+    ) -> Result<QueryResult, SqlDatabaseError> {
         let mut candidate_indices: Option<Vec<usize>> = None;
-        if let Some(predicate) = &predicate {
+        if let Some(predicate) = predicate {
             if let Some(partitioning) = &table.partitioning {
                 if partitioning.matches_column(predicate.column_name()) {
                     match predicate {
@@ -362,14 +379,16 @@ impl SqlDatabase {
                 }
             }
         }
+
         let iter: Box<dyn Iterator<Item = usize>> = match candidate_indices {
             Some(indices) => Box::new(indices.into_iter()),
             None => Box::new(0..table.rows.len()),
         };
+
         let mut matching_indices = Vec::new();
         for row_index in iter {
             let row = &table.rows[row_index];
-            if let Some(predicate) = &predicate {
+            if let Some(predicate) = predicate {
                 if !self.evaluate_predicate(table, predicate, row)? {
                     continue;
                 }
@@ -396,7 +415,7 @@ impl SqlDatabase {
                 for item in items {
                     match item {
                         SelectItem::Column(name) => {
-                            let idx = self.column_index(table, &name)?;
+                            let idx = self.column_index(table, name)?;
                             let output_name = table.columns[idx].name.clone();
                             projections.push(PreparedProjection {
                                 output_name,
@@ -409,7 +428,7 @@ impl SqlDatabase {
                                 .alias
                                 .clone()
                                 .unwrap_or_else(|| spec.function.default_alias().to_string());
-                            window_specs.push(spec);
+                            window_specs.push(spec.clone());
                             projections.push(PreparedProjection {
                                 output_name,
                                 kind: ProjectionKind::Window {
@@ -451,6 +470,158 @@ impl SqlDatabase {
                 Ok(QueryResult::Rows { columns, rows })
             }
         }
+    }
+
+    fn materialize_ctes(
+        &self,
+        ctes: &[CommonTableExpression],
+    ) -> Result<HashMap<String, Table>, SqlDatabaseError> {
+        let mut tables = HashMap::new();
+        for cte in ctes {
+            if tables.contains_key(&cte.name) {
+                return Err(SqlDatabaseError::Parse(format!(
+                    "duplicate CTE name '{}'",
+                    cte.name
+                )));
+            }
+            let result = self.exec_select_statement(&tables, &cte.select)?;
+            let table = match result {
+                QueryResult::Rows { columns, rows } => table_from_rows(columns, rows),
+                _ => return Err(SqlDatabaseError::Unsupported),
+            };
+            tables.insert(cte.name.clone(), table);
+        }
+        Ok(tables)
+    }
+
+    fn exec_merge(
+        &mut self,
+        ctes: Vec<CommonTableExpression>,
+        merge: MergeStatement,
+    ) -> Result<QueryResult, SqlDatabaseError> {
+        let cte_tables = self.materialize_ctes(&ctes)?;
+
+        let source_table = if let Some(table) = cte_tables.get(&merge.source.name) {
+            Table {
+                columns: table.columns.clone(),
+                rows: table.rows.clone(),
+                partitioning: None,
+                partitions: BTreeMap::new(),
+            }
+        } else {
+            let table = self
+                .tables
+                .get(&merge.source.name)
+                .ok_or_else(|| SqlDatabaseError::UnknownTable(merge.source.name.clone()))?;
+            Table {
+                columns: table.columns.clone(),
+                rows: table.rows.clone(),
+                partitioning: None,
+                partitions: BTreeMap::new(),
+            }
+        };
+
+        let target_name = merge.target.name.clone();
+        let (target_on_idx, matched_assignments, insert_info) = {
+            let table = self
+                .tables
+                .get(&target_name)
+                .ok_or_else(|| SqlDatabaseError::UnknownTable(target_name.clone()))?;
+            let target_on_idx = column_index_in_table(table, &merge.condition.target_column)?;
+            let matched_assignments = if let Some(update) = &merge.when_matched {
+                let mut assignments = Vec::new();
+                for assignment in &update.assignments {
+                    let idx = column_index_in_table(table, &assignment.column)?;
+                    assignments.push((idx, &assignment.value));
+                }
+                Some(assignments)
+            } else {
+                None
+            };
+            let insert_info = if let Some(insert) = &merge.when_not_matched {
+                let mut indices = Vec::new();
+                for column in &insert.columns {
+                    let idx = column_index_in_table(table, column)?;
+                    indices.push(idx);
+                }
+                Some((indices, insert.values.iter().collect::<Vec<_>>()))
+            } else {
+                None
+            };
+            (target_on_idx, matched_assignments, insert_info)
+        };
+
+        let target_table = self
+            .tables
+            .get_mut(&target_name)
+            .ok_or_else(|| SqlDatabaseError::UnknownTable(target_name.clone()))?;
+
+        let source_on_idx = column_index_in_table(&source_table, &merge.condition.source_column)?;
+
+        let mut modified = false;
+
+        for source_row in &source_table.rows {
+            let source_key = &source_row[source_on_idx];
+            let mut matched_index = None;
+            for (idx, target_row) in target_table.rows.iter().enumerate() {
+                if equal(&target_row[target_on_idx], source_key) {
+                    matched_index = Some(idx);
+                    break;
+                }
+            }
+
+            if let Some(idx) = matched_index {
+                if let Some(assignments) = &matched_assignments {
+                    let computed_values = {
+                        let current_row = &target_table.rows[idx];
+                        let mut values = Vec::new();
+                        for (column_index, value_expr) in assignments {
+                            let value = evaluate_merge_value(
+                                &merge,
+                                value_expr,
+                                target_table,
+                                Some(current_row),
+                                &source_table,
+                                source_row,
+                            )?;
+                            let coerced =
+                                coerce_value(value, target_table.columns[*column_index].ty)?;
+                            values.push((*column_index, coerced));
+                        }
+                        values
+                    };
+                    let row = &mut target_table.rows[idx];
+                    for (column_index, value) in computed_values {
+                        row[column_index] = value;
+                    }
+                    modified = true;
+                }
+            } else if let Some((column_indices, value_exprs)) = &insert_info {
+                let mut new_row = vec![Value::Null; target_table.columns.len()];
+                for (column_index, value_expr) in
+                    column_indices.iter().zip(value_exprs.iter().copied())
+                {
+                    let value = evaluate_merge_value(
+                        &merge,
+                        value_expr,
+                        target_table,
+                        None,
+                        &source_table,
+                        source_row,
+                    )?;
+                    let coerced = coerce_value(value, target_table.columns[*column_index].ty)?;
+                    new_row[*column_index] = coerced;
+                }
+                target_table.rows.push(new_row);
+                modified = true;
+            }
+        }
+
+        if modified && target_table.partitioning.is_some() {
+            rebuild_partitions(target_table);
+        }
+
+        Ok(QueryResult::None)
     }
 
     fn exec_create_graph(&mut self, name: String) -> Result<(), SqlDatabaseError> {
@@ -679,6 +850,86 @@ impl SqlDatabase {
 }
 
 #[derive(Debug)]
+struct SelectStatement {
+    table: String,
+    columns: SelectColumns,
+    predicate: Option<Predicate>,
+}
+
+#[derive(Debug)]
+struct CommonTableExpression {
+    name: String,
+    select: SelectStatement,
+}
+
+#[derive(Debug)]
+struct MergeStatement {
+    target: TableReference,
+    source: TableReference,
+    condition: MergeCondition,
+    when_matched: Option<MergeUpdate>,
+    when_not_matched: Option<MergeInsert>,
+}
+
+#[derive(Debug)]
+struct MergeCondition {
+    target_column: String,
+    source_column: String,
+}
+
+#[derive(Debug)]
+struct MergeUpdate {
+    assignments: Vec<MergeAssignment>,
+}
+
+#[derive(Debug)]
+struct MergeAssignment {
+    column: String,
+    value: MergeValue,
+}
+
+#[derive(Debug)]
+struct MergeInsert {
+    columns: Vec<String>,
+    values: Vec<MergeValue>,
+}
+
+#[derive(Debug)]
+enum MergeValue {
+    Literal(Value),
+    Column {
+        table: Option<String>,
+        column: String,
+    },
+}
+
+#[derive(Debug)]
+struct TableReference {
+    name: String,
+    alias: Option<String>,
+}
+
+impl TableReference {
+    fn matches(&self, identifier: &str) -> bool {
+        if self.name.eq_ignore_ascii_case(identifier) {
+            return true;
+        }
+        if let Some(alias) = &self.alias {
+            if alias.eq_ignore_ascii_case(identifier) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug)]
+struct QualifiedColumn {
+    table: String,
+    column: String,
+}
+
+#[derive(Debug)]
 enum Statement {
     CreateTable {
         name: String,
@@ -691,9 +942,12 @@ enum Statement {
         rows: Vec<Vec<Value>>,
     },
     Select {
-        table: String,
-        columns: SelectColumns,
-        predicate: Option<Predicate>,
+        ctes: Vec<CommonTableExpression>,
+        body: SelectStatement,
+    },
+    Merge {
+        ctes: Vec<CommonTableExpression>,
+        merge: MergeStatement,
     },
     CreateGraph {
         name: String,
@@ -719,13 +973,13 @@ enum Statement {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum SelectColumns {
     All,
     Some(Vec<SelectItem>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum SelectItem {
     Column(String),
     WindowFunction(WindowFunctionExpr),
@@ -792,7 +1046,21 @@ fn parse_statement(sql: &str) -> Result<Statement, SqlDatabaseError> {
         return Err(SqlDatabaseError::Parse("empty SQL statement".into()));
     }
     let trimmed = trimmed.trim_end_matches(';').trim();
-    if let Some(rest) = strip_keyword_ci(trimmed, "CREATE") {
+    if let Some(rest) = strip_keyword_ci(trimmed, "WITH") {
+        let (ctes, remainder) = parse_common_table_expressions(rest)?;
+        let remainder = remainder.trim_start();
+        if let Some(rest_select) = strip_keyword_ci(remainder, "SELECT") {
+            let select = parse_select_statement(rest_select)?;
+            Ok(Statement::Select { ctes, body: select })
+        } else if let Some(rest_merge) = strip_keyword_ci(remainder, "MERGE") {
+            let merge = parse_merge_statement(rest_merge)?;
+            Ok(Statement::Merge { ctes, merge })
+        } else {
+            Err(SqlDatabaseError::Parse(
+                "WITH clause must be followed by SELECT or MERGE".into(),
+            ))
+        }
+    } else if let Some(rest) = strip_keyword_ci(trimmed, "CREATE") {
         let rest = rest.trim_start();
         if let Some(rest) = strip_keyword_ci(rest, "TABLE") {
             parse_create_table(rest)
@@ -811,7 +1079,17 @@ fn parse_statement(sql: &str) -> Result<Statement, SqlDatabaseError> {
         let rest = expect_keyword_ci(rest, "INTO")?;
         parse_insert(rest)
     } else if let Some(rest) = strip_keyword_ci(trimmed, "SELECT") {
-        parse_select(rest)
+        let select = parse_select_statement(rest)?;
+        Ok(Statement::Select {
+            ctes: Vec::new(),
+            body: select,
+        })
+    } else if let Some(rest) = strip_keyword_ci(trimmed, "MERGE") {
+        let merge = parse_merge_statement(rest)?;
+        Ok(Statement::Merge {
+            ctes: Vec::new(),
+            merge,
+        })
     } else if let Some(rest) = strip_keyword_ci(trimmed, "MATCH") {
         let rest = expect_keyword_ci(rest, "GRAPH")?;
         parse_match_graph(rest)
@@ -1152,7 +1430,41 @@ fn parse_match_graph(input: &str) -> Result<Statement, SqlDatabaseError> {
     })
 }
 
-fn parse_select(input: &str) -> Result<Statement, SqlDatabaseError> {
+fn parse_common_table_expressions(
+    input: &str,
+) -> Result<(Vec<CommonTableExpression>, &str), SqlDatabaseError> {
+    let mut remainder = input;
+    let mut ctes = Vec::new();
+    loop {
+        let (name, rest) = parse_identifier(remainder)?;
+        let rest = expect_keyword_ci(rest, "AS")?;
+        let rest = rest.trim_start();
+        if !rest.starts_with('(') {
+            return Err(SqlDatabaseError::Parse(
+                "CTE definition must use parentheses".into(),
+            ));
+        }
+        let (body, rest_after) = take_parenthesized(rest)?;
+        let body_trimmed = body.trim();
+        let select = if let Some(select_body) = strip_keyword_ci(body_trimmed, "SELECT") {
+            parse_select_statement(select_body)?
+        } else {
+            return Err(SqlDatabaseError::Parse(
+                "CTE body must be a SELECT statement".into(),
+            ));
+        };
+        ctes.push(CommonTableExpression { name, select });
+        remainder = rest_after.trim_start();
+        if remainder.starts_with(',') {
+            remainder = remainder[1..].trim_start();
+            continue;
+        }
+        break;
+    }
+    Ok((ctes, remainder))
+}
+
+fn parse_select_statement(input: &str) -> Result<SelectStatement, SqlDatabaseError> {
     let (columns_raw, rest) = split_keyword_ci(input, "FROM")
         .ok_or_else(|| SqlDatabaseError::Parse("missing FROM clause".into()))?;
     let columns_raw = columns_raw.trim();
@@ -1190,11 +1502,341 @@ fn parse_select(input: &str) -> Result<Statement, SqlDatabaseError> {
             Some(Predicate::Equals { column, value })
         }
     };
-    Ok(Statement::Select {
+    Ok(SelectStatement {
         table,
         columns: select_columns,
         predicate,
     })
+}
+
+fn parse_merge_statement(input: &str) -> Result<MergeStatement, SqlDatabaseError> {
+    let rest = expect_keyword_ci(input, "INTO")?;
+    let (target, rest) = parse_table_reference(rest)?;
+    let rest = expect_keyword_ci(rest, "USING")?;
+    let (source, rest) = parse_table_reference(rest)?;
+    let rest = expect_keyword_ci(rest, "ON")?;
+    let (left, rest) = parse_qualified_column(rest)?;
+    let rest = rest.trim_start();
+    if !rest.starts_with('=') {
+        return Err(SqlDatabaseError::Parse("ON clause must contain '='".into()));
+    }
+    let (right, mut remainder) = parse_qualified_column(&rest[1..])?;
+    let (target_column, source_column) =
+        if target.matches(&left.table) && source.matches(&right.table) {
+            (left.column, right.column)
+        } else if target.matches(&right.table) && source.matches(&left.table) {
+            (right.column, left.column)
+        } else {
+            return Err(SqlDatabaseError::Parse(
+                "ON clause must compare target and source columns".into(),
+            ));
+        };
+
+    let mut when_matched = None;
+    let mut when_not_matched = None;
+    loop {
+        let trimmed = remainder.trim_start();
+        if trimmed.is_empty() {
+            remainder = trimmed;
+            break;
+        }
+        if let Some(rest) = strip_keyword_ci(trimmed, "WHEN") {
+            let rest = rest.trim_start();
+            if let Some(rest) = strip_keyword_ci(rest, "MATCHED") {
+                if when_matched.is_some() {
+                    return Err(SqlDatabaseError::Parse(
+                        "multiple WHEN MATCHED clauses".into(),
+                    ));
+                }
+                let rest = expect_keyword_ci(rest, "THEN")?;
+                let (update, rest_after) = parse_merge_update_clause(rest, &target, &source)?;
+                when_matched = Some(update);
+                remainder = rest_after;
+                continue;
+            } else if let Some(rest) = strip_keyword_ci(rest, "NOT") {
+                let rest = expect_keyword_ci(rest, "MATCHED")?;
+                if when_not_matched.is_some() {
+                    return Err(SqlDatabaseError::Parse(
+                        "multiple WHEN NOT MATCHED clauses".into(),
+                    ));
+                }
+                let rest = expect_keyword_ci(rest, "THEN")?;
+                let (insert, rest_after) = parse_merge_insert_clause(rest, &target, &source)?;
+                when_not_matched = Some(insert);
+                remainder = rest_after;
+                continue;
+            } else {
+                return Err(SqlDatabaseError::Parse("unsupported WHEN clause".into()));
+            }
+        }
+        remainder = trimmed;
+        break;
+    }
+
+    ensure_no_trailing_tokens(remainder)?;
+    Ok(MergeStatement {
+        target,
+        source,
+        condition: MergeCondition {
+            target_column,
+            source_column,
+        },
+        when_matched,
+        when_not_matched,
+    })
+}
+
+fn parse_table_reference(input: &str) -> Result<(TableReference, &str), SqlDatabaseError> {
+    let (name, rest) = parse_identifier(input)?;
+    let rest = rest.trim_start();
+    if let Some(rest) = strip_keyword_ci(rest, "AS") {
+        let (alias, rest_after) = parse_identifier(rest)?;
+        Ok((
+            TableReference {
+                name,
+                alias: Some(alias),
+            },
+            rest_after,
+        ))
+    } else {
+        Ok((TableReference { name, alias: None }, rest))
+    }
+}
+
+fn parse_qualified_column(input: &str) -> Result<(QualifiedColumn, &str), SqlDatabaseError> {
+    let (table, rest) = parse_identifier(input.trim_start())?;
+    let rest = rest.trim_start();
+    if !rest.starts_with('.') {
+        return Err(SqlDatabaseError::Parse(
+            "qualified column must include '.'".into(),
+        ));
+    }
+    let (column, rest_after) = parse_identifier(&rest[1..])?;
+    Ok((QualifiedColumn { table, column }, rest_after))
+}
+
+fn parse_merge_update_clause<'a>(
+    input: &'a str,
+    target: &TableReference,
+    source: &TableReference,
+) -> Result<(MergeUpdate, &'a str), SqlDatabaseError> {
+    let rest = expect_keyword_ci(input, "UPDATE")?;
+    let rest = expect_keyword_ci(rest, "SET")?;
+    let (assignments, remainder) = parse_merge_assignments(rest, target, source)?;
+    Ok((MergeUpdate { assignments }, remainder))
+}
+
+fn parse_merge_insert_clause<'a>(
+    input: &'a str,
+    target: &TableReference,
+    source: &TableReference,
+) -> Result<(MergeInsert, &'a str), SqlDatabaseError> {
+    let rest = expect_keyword_ci(input, "INSERT")?;
+    let rest = rest.trim_start();
+    if !rest.starts_with('(') {
+        return Err(SqlDatabaseError::Parse(
+            "INSERT clause requires column list".into(),
+        ));
+    }
+    let (columns_raw, rest_after) = take_parenthesized(rest)?;
+    let mut columns = Vec::new();
+    for part in split_comma(&columns_raw)? {
+        let trimmed = part.trim();
+        let (column, remainder) = parse_target_column(trimmed, target)?;
+        ensure_no_trailing_tokens(remainder)?;
+        columns.push(column);
+    }
+    let rest = expect_keyword_ci(rest_after, "VALUES")?;
+    let (values_raw, remainder) = take_parenthesized(rest)?;
+    let parts = split_comma(&values_raw)?;
+    if columns.len() != parts.len() {
+        return Err(SqlDatabaseError::Parse(
+            "INSERT column count must match values".into(),
+        ));
+    }
+    let mut values = Vec::new();
+    for part in parts {
+        let (value, remainder) = parse_merge_value(&part, target, source)?;
+        ensure_no_trailing_tokens(remainder)?;
+        values.push(value);
+    }
+    Ok((MergeInsert { columns, values }, remainder))
+}
+
+fn parse_merge_assignments<'a>(
+    input: &'a str,
+    target: &TableReference,
+    source: &TableReference,
+) -> Result<(Vec<MergeAssignment>, &'a str), SqlDatabaseError> {
+    let mut assignments = Vec::new();
+    let mut remainder = input;
+    loop {
+        let (column, rest) = parse_target_column(remainder, target)?;
+        let rest = rest.trim_start();
+        if !rest.starts_with('=') {
+            return Err(SqlDatabaseError::Parse("expected '=' in assignment".into()));
+        }
+        let (value, rest_after) = parse_merge_value(&rest[1..], target, source)?;
+        assignments.push(MergeAssignment { column, value });
+        remainder = rest_after.trim_start();
+        if remainder.starts_with(',') {
+            remainder = remainder[1..].trim_start();
+            continue;
+        }
+        break;
+    }
+    Ok((assignments, remainder))
+}
+
+fn parse_target_column<'a>(
+    input: &'a str,
+    target: &TableReference,
+) -> Result<(String, &'a str), SqlDatabaseError> {
+    let trimmed = input.trim_start();
+    let (identifier, rest) = parse_identifier(trimmed)?;
+    let rest_trimmed = rest.trim_start();
+    if rest_trimmed.starts_with('.') {
+        let (column, rest_after) = parse_identifier(&rest_trimmed[1..])?;
+        if !target.matches(&identifier) {
+            return Err(SqlDatabaseError::Parse(format!(
+                "unknown table '{identifier}' in MERGE assignment"
+            )));
+        }
+        Ok((column, rest_after))
+    } else {
+        Ok((identifier, rest_trimmed))
+    }
+}
+
+fn parse_merge_value<'a>(
+    input: &'a str,
+    target: &TableReference,
+    source: &TableReference,
+) -> Result<(MergeValue, &'a str), SqlDatabaseError> {
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() {
+        return Err(SqlDatabaseError::Parse("missing value".into()));
+    }
+    let first = trimmed.chars().next().unwrap();
+    if first == '\'' || first == '"' || first.is_ascii_digit() || first == '-' {
+        let (value, rest) = parse_literal_token(trimmed)?;
+        return Ok((MergeValue::Literal(value), rest));
+    }
+    let (ident, rest) = parse_identifier(trimmed)?;
+    let rest_trimmed = rest.trim_start();
+    if rest_trimmed.starts_with('.') {
+        let (column, rest_after) = parse_identifier(&rest_trimmed[1..])?;
+        if target.matches(&ident) || source.matches(&ident) {
+            return Ok((
+                MergeValue::Column {
+                    table: Some(ident),
+                    column,
+                },
+                rest_after,
+            ));
+        } else {
+            return Err(SqlDatabaseError::Parse(format!(
+                "unknown table '{ident}' in MERGE expression",
+            )));
+        }
+    }
+    let upper = ident.to_ascii_uppercase();
+    if matches!(upper.as_str(), "NULL" | "TRUE" | "FALSE") {
+        let value = parse_value(ident.as_str())?;
+        return Ok((MergeValue::Literal(value), rest_trimmed));
+    }
+    Ok((
+        MergeValue::Column {
+            table: None,
+            column: ident,
+        },
+        rest_trimmed,
+    ))
+}
+
+fn column_index_in_table(table: &Table, name: &str) -> Result<usize, SqlDatabaseError> {
+    table
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| SqlDatabaseError::UnknownColumn(name.into()))
+}
+
+fn table_from_rows(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Table {
+    let mut table = Table::default();
+    let mut column_defs = Vec::new();
+    for (index, name) in columns.into_iter().enumerate() {
+        let ty = infer_column_type(&rows, index);
+        column_defs.push(Column { name, ty });
+    }
+    table.columns = column_defs;
+    table.rows = rows;
+    table
+}
+
+fn infer_column_type(rows: &[Vec<Value>], index: usize) -> ColumnType {
+    for row in rows {
+        if let Some(value) = row.get(index) {
+            match value {
+                Value::Integer(_) => return ColumnType::Integer,
+                Value::Float(_) => return ColumnType::Float,
+                Value::Text(_) => return ColumnType::Text,
+                Value::Boolean(_) => return ColumnType::Boolean,
+                Value::Timestamp(_) => return ColumnType::Timestamp,
+                Value::Null => continue,
+            }
+        }
+    }
+    ColumnType::Text
+}
+
+fn rebuild_partitions(table: &mut Table) {
+    table.partitions.clear();
+    if let Some(partitioning) = &table.partitioning {
+        for (idx, row) in table.rows.iter().enumerate() {
+            if let Some(value) = row.get(partitioning.column_index) {
+                if let Some(key) = partitioning.partition_key(value) {
+                    table.partitions.entry(key).or_default().push(idx);
+                }
+            }
+        }
+    }
+}
+
+fn evaluate_merge_value(
+    merge: &MergeStatement,
+    value: &MergeValue,
+    target_table: &Table,
+    target_row: Option<&[Value]>,
+    source_table: &Table,
+    source_row: &[Value],
+) -> Result<Value, SqlDatabaseError> {
+    match value {
+        MergeValue::Literal(v) => Ok(v.clone()),
+        MergeValue::Column { table, column } => {
+            if let Some(table_name) = table {
+                if merge.target.matches(table_name) {
+                    let row = target_row.ok_or_else(|| {
+                        SqlDatabaseError::SchemaMismatch(
+                            "cannot reference target columns in INSERT".into(),
+                        )
+                    })?;
+                    let idx = column_index_in_table(target_table, column)?;
+                    Ok(row[idx].clone())
+                } else if merge.source.matches(table_name) {
+                    let idx = column_index_in_table(source_table, column)?;
+                    Ok(source_row[idx].clone())
+                } else {
+                    Err(SqlDatabaseError::UnknownColumn(format!(
+                        "{table_name}.{column}"
+                    )))
+                }
+            } else {
+                let idx = column_index_in_table(source_table, column)?;
+                Ok(source_row[idx].clone())
+            }
+        }
+    }
 }
 
 fn parse_select_item(input: &str) -> Result<SelectItem, SqlDatabaseError> {
@@ -1955,6 +2597,92 @@ mod tests {
             QueryResult::Rows { columns, rows } => {
                 assert_eq!(columns, vec!["row_number"]);
                 assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn select_with_cte() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE base (id INT, value INT);")
+            .unwrap();
+        db.execute("INSERT INTO base VALUES (1, 10), (2, 20);")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "WITH filtered AS (SELECT id, value FROM base WHERE value = 20) SELECT id FROM filtered;",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["id"]);
+                assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn merge_upserts_rows() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE target (id INT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO target VALUES (1, 10);").unwrap();
+        db.execute("CREATE TABLE updates (id INT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO updates VALUES (1, 100), (2, 200);")
+            .unwrap();
+
+        db.execute(
+            "MERGE INTO target USING updates ON target.id = updates.id \
+             WHEN MATCHED THEN UPDATE SET amount = updates.amount \
+             WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (updates.id, updates.amount);",
+        )
+        .unwrap();
+
+        let result = db.execute("SELECT * FROM target;").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["id", "amount"]);
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(100)]);
+                assert_eq!(rows[1], vec![Value::Integer(2), Value::Integer(200)]);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn merge_with_cte_source() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE dest (id INT, name TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO dest VALUES (1, 'old');").unwrap();
+        db.execute("CREATE TABLE staging (id INT, name TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO staging VALUES (1, 'new'), (3, 'third');")
+            .unwrap();
+
+        db.execute(
+            "WITH candidate AS (SELECT id, name FROM staging) \
+             MERGE INTO dest USING candidate ON dest.id = candidate.id \
+             WHEN MATCHED THEN UPDATE SET name = candidate.name \
+             WHEN NOT MATCHED THEN INSERT (id, name) VALUES (candidate.id, candidate.name);",
+        )
+        .unwrap();
+
+        let result = db.execute("SELECT * FROM dest;").unwrap();
+        match result {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["id", "name"]);
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0], vec![Value::Integer(1), Value::Text("new".into())]);
+                assert_eq!(
+                    rows[1],
+                    vec![Value::Integer(3), Value::Text("third".into())]
+                );
             }
             _ => panic!("unexpected result"),
         }
