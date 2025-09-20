@@ -2092,6 +2092,15 @@ fn full_text_matches(value: &Value, query: &str, language: Option<&str>) -> bool
         .all(|token| doc_set.contains(&token))
 }
 
+const ENGLISH_STOPWORDS: &[&str] = &[
+    "the", "and", "or", "a", "an", "of", "to", "in", "on", "for", "with", "is", "it", "this",
+    "that", "by", "from", "as", "at", "be", "are", "was", "were",
+];
+
+const SPANISH_STOPWORDS: &[&str] = &[
+    "el", "la", "los", "las", "y", "de", "del", "que", "un", "una", "en", "por",
+];
+
 fn analyze_text(text: &str, language: Option<&str>) -> Vec<String> {
     let mut tokens = Vec::new();
     for part in text.split(|c: char| !c.is_alphanumeric()) {
@@ -2113,20 +2122,24 @@ fn analyze_text(text: &str, language: Option<&str>) -> Vec<String> {
 }
 
 fn apply_english_rules(token: String) -> Option<String> {
-    let stopwords = [
-        "the", "and", "or", "a", "an", "of", "to", "in", "on", "for", "with",
-    ];
-    if stopwords.iter().any(|&stop| stop == token) {
+    if ENGLISH_STOPWORDS.iter().any(|&stop| stop == token) {
         return None;
     }
     Some(stem_english(&token))
 }
 
 fn stem_english(token: &str) -> String {
+    if token.ends_with("ies") && token.len() > 4 {
+        let stem = &token[..token.len() - 3];
+        return format!("{stem}y");
+    }
     if token.ends_with("ing") && token.len() > 4 {
         return token[..token.len() - 3].to_string();
     }
     if token.ends_with("ed") && token.len() > 3 {
+        return token[..token.len() - 2].to_string();
+    }
+    if token.ends_with("es") && token.len() > 4 {
         return token[..token.len() - 2].to_string();
     }
     if token.ends_with('s') && token.len() > 3 {
@@ -2136,14 +2149,19 @@ fn stem_english(token: &str) -> String {
 }
 
 fn apply_spanish_rules(token: String) -> Option<String> {
-    let stopwords = ["el", "la", "los", "las", "y", "de", "del", "que"];
-    if stopwords.iter().any(|&stop| stop == token) {
+    if SPANISH_STOPWORDS.iter().any(|&stop| stop == token) {
         return None;
     }
     Some(stem_spanish(&token))
 }
 
 fn stem_spanish(token: &str) -> String {
+    if token.ends_with("mente") && token.len() > 6 {
+        return token[..token.len() - 5].to_string();
+    }
+    if token.ends_with("aciones") && token.len() > 8 {
+        return token[..token.len() - 6].to_string();
+    }
     if token.ends_with("es") && token.len() > 4 {
         return token[..token.len() - 2].to_string();
     }
@@ -3124,6 +3142,36 @@ mod tests {
                 let mut ids = rows
                     .into_iter()
                     .map(|row| match row[0] {
+                        Value::Integer(id) => id,
+                        _ => panic!("unexpected id"),
+                    })
+                    .collect::<Vec<_>>();
+                ids.sort();
+                assert_eq!(ids, vec![1, 2]);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn full_text_spanish_analyzer() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE textos (id INT, contenido TEXT);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO textos VALUES (1, 'Los sistemas distribuidos'), (2, 'Arquitectura de sistemas complejos');",
+        )
+        .unwrap();
+
+        let result = db
+            .execute("SELECT id FROM textos WHERE contenido @@ 'los sistemas' LANGUAGE 'spanish';")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                let mut ids = rows
+                    .into_iter()
+                    .map(|row| match row.into_iter().next().unwrap() {
                         Value::Integer(id) => id,
                         _ => panic!("unexpected id"),
                     })
