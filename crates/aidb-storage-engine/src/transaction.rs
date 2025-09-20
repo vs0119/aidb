@@ -28,11 +28,13 @@ pub struct Transaction {
     pub id: TransactionId,
     pub state: TransactionState,
     pub isolation_level: IsolationLevel,
-    pub snapshot: TransactionSnapshot,
+    pub snapshot: Arc<RwLock<TransactionSnapshot>>,
     pub start_time: Instant,
     pub locks_held: Arc<RwLock<HashSet<PageId>>>,
     pub read_set: Arc<RwLock<HashSet<PageId>>>,
     pub write_set: Arc<RwLock<HashSet<PageId>>>,
+    savepoints: Arc<RwLock<Vec<Savepoint>>>,
+    nested_stack: Arc<RwLock<Vec<String>>>,
 }
 
 impl Transaction {
@@ -45,11 +47,13 @@ impl Transaction {
             id,
             state: TransactionState::Active,
             isolation_level,
-            snapshot,
+            snapshot: Arc::new(RwLock::new(snapshot)),
             start_time: Instant::now(),
             locks_held: Arc::new(RwLock::new(HashSet::new())),
             read_set: Arc::new(RwLock::new(HashSet::new())),
             write_set: Arc::new(RwLock::new(HashSet::new())),
+            savepoints: Arc::new(RwLock::new(Vec::new())),
+            nested_stack: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -63,6 +67,98 @@ impl Transaction {
 
     pub fn duration(&self) -> Duration {
         self.start_time.elapsed()
+    }
+
+    pub fn snapshot(&self) -> TransactionSnapshot {
+        self.snapshot.read().clone()
+    }
+
+    pub fn create_savepoint(&self, name: impl Into<String>) -> Result<()> {
+        let name = name.into();
+
+        let mut savepoints = self.savepoints.write();
+        if savepoints.iter().any(|sp| sp.name == name) {
+            return Err(StorageEngineError::TransactionConflict(format!(
+                "Savepoint '{}' already exists",
+                name
+            )));
+        }
+
+        let snapshot = self.snapshot();
+        let read_set = self.read_set.read().clone();
+        let write_set = self.write_set.read().clone();
+
+        savepoints.push(Savepoint {
+            name,
+            snapshot,
+            read_set,
+            write_set,
+            created_at: Instant::now(),
+        });
+
+        Ok(())
+    }
+
+    pub fn release_savepoint(&self, name: &str) -> Result<()> {
+        let mut savepoints = self.savepoints.write();
+
+        if let Some(pos) = savepoints.iter().rposition(|sp| sp.name == name) {
+            savepoints.remove(pos);
+            return Ok(());
+        }
+
+        Err(StorageEngineError::TransactionConflict(format!(
+            "Savepoint '{}' not found",
+            name
+        )))
+    }
+
+    pub fn rollback_to_savepoint(&self, name: &str) -> Result<()> {
+        let mut savepoints = self.savepoints.write();
+
+        let Some(pos) = savepoints.iter().rposition(|sp| sp.name == name) else {
+            return Err(StorageEngineError::TransactionConflict(format!(
+                "Savepoint '{}' not found",
+                name
+            )));
+        };
+
+        let savepoint = savepoints[pos].clone();
+        savepoints.truncate(pos + 1);
+        drop(savepoints);
+
+        *self.read_set.write() = savepoint.read_set;
+        *self.write_set.write() = savepoint.write_set;
+        *self.snapshot.write() = savepoint.snapshot;
+
+        Ok(())
+    }
+
+    pub fn begin_nested(&self, name: impl Into<String>) -> Result<NestedTransaction> {
+        let name = name.into();
+        let mut nested_stack = self.nested_stack.write();
+        let depth = nested_stack.len() + 1;
+        let savepoint_name = format!("{}::{}::{}", self.id, depth, name);
+        drop(nested_stack);
+
+        self.create_savepoint(savepoint_name.clone())?;
+
+        let mut nested_stack = self.nested_stack.write();
+        nested_stack.push(savepoint_name.clone());
+
+        Ok(NestedTransaction {
+            transaction: self.clone(),
+            name,
+            savepoint: savepoint_name,
+            depth,
+        })
+    }
+
+    fn pop_nested(&self, savepoint: &str) {
+        let mut nested_stack = self.nested_stack.write();
+        if let Some(pos) = nested_stack.iter().rposition(|entry| entry == savepoint) {
+            nested_stack.remove(pos);
+        }
     }
 
     pub fn has_conflict_with(&self, other: &Transaction) -> bool {
@@ -83,6 +179,45 @@ impl Transaction {
         }
 
         false
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Savepoint {
+    name: String,
+    snapshot: TransactionSnapshot,
+    read_set: HashSet<PageId>,
+    write_set: HashSet<PageId>,
+    created_at: Instant,
+}
+
+pub struct NestedTransaction {
+    transaction: Transaction,
+    name: String,
+    savepoint: String,
+    depth: usize,
+}
+
+impl NestedTransaction {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    pub fn commit(self) -> Result<()> {
+        self.transaction.release_savepoint(&self.savepoint)?;
+        self.transaction.pop_nested(&self.savepoint);
+        Ok(())
+    }
+
+    pub fn rollback(self) -> Result<()> {
+        self.transaction.rollback_to_savepoint(&self.savepoint)?;
+        self.transaction.release_savepoint(&self.savepoint)?;
+        self.transaction.pop_nested(&self.savepoint);
+        Ok(())
     }
 }
 
@@ -321,7 +456,8 @@ impl TransactionManager {
                 xmax: u64::MAX,
             },
             IsolationLevel::ReadCommitted => {
-                let active_xids: Vec<_> = active_transactions.keys().copied().collect();
+                let mut active_xids: Vec<_> = active_transactions.keys().copied().collect();
+                active_xids.sort_unstable();
                 TransactionSnapshot {
                     xid,
                     active_xids: Arc::new(active_xids),
@@ -330,7 +466,8 @@ impl TransactionManager {
                 }
             }
             IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
-                let active_xids: Vec<_> = active_transactions.keys().copied().collect();
+                let mut active_xids: Vec<_> = active_transactions.keys().copied().collect();
+                active_xids.sort_unstable();
                 TransactionSnapshot {
                     xid,
                     active_xids: Arc::new(active_xids),
@@ -392,7 +529,8 @@ impl TransactionManager {
 
     fn update_global_snapshot(&self) {
         let active_transactions = self.active_transactions.read();
-        let active_xids: Vec<_> = active_transactions.keys().copied().collect();
+        let mut active_xids: Vec<_> = active_transactions.keys().copied().collect();
+        active_xids.sort_unstable();
 
         let mut global_snapshot = self.global_snapshot.write();
         global_snapshot.active_xids = Arc::new(active_xids);

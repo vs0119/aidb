@@ -166,7 +166,7 @@ impl StorageEngine {
         let page_guard = page.read().await;
 
         if let Some(row) = page_guard.get_row(row_id.slot_id)? {
-            if row.is_visible(&txn.snapshot) {
+            if row.is_visible(&txn.snapshot()) {
                 self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(row));
             }
@@ -187,7 +187,7 @@ impl StorageEngine {
         let mut page_guard = page.write().await;
 
         if let Some(mut row) = page_guard.get_row(row_id.slot_id)? {
-            if !row.is_visible(&txn.snapshot) {
+            if !row.is_visible(&txn.snapshot()) {
                 return Err(StorageEngineError::TransactionConflict(
                     "Row not visible".to_string(),
                 ));
@@ -209,7 +209,7 @@ impl StorageEngine {
         let mut page_guard = page.write().await;
 
         if let Some(mut row) = page_guard.get_row(row_id.slot_id)? {
-            if !row.is_visible(&txn.snapshot) {
+            if !row.is_visible(&txn.snapshot()) {
                 return Ok(false);
             }
 
