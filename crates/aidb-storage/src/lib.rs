@@ -568,6 +568,11 @@ impl<I: VectorIndex> Collection<I> {
         self.index.read().len()
     }
 
+    pub fn with_index<T>(&self, f: impl FnOnce(&I) -> T) -> T {
+        let guard = self.index.read();
+        f(&*guard)
+    }
+
     pub fn with_index_mut<T>(&self, f: impl FnOnce(&mut I) -> T) -> T {
         let mut guard = self.index.write();
         f(&mut *guard)

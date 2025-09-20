@@ -92,4 +92,10 @@ final class AIDBClient {
         let (d, _) = try await session.data(for: r)
         return try JSONDecoder().decode(Bool.self, from: d)
     }
+
+    func metrics() async throws -> String {
+        let url = baseURL.appending(path: "/metrics")
+        let (d, _) = try await session.data(from: url)
+        return String(decoding: d, as: UTF8.self)
+    }
 }

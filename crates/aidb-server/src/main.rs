@@ -322,9 +322,18 @@ struct CollectionInfoResp {
     dim: usize,
     metric: String,
     len: usize,
+    index: String,
+    hnsw: Option<HnswParamsResp>,
     wal_size_bytes: u64,
     wal_last_truncate: Option<String>,
     wal_bytes_since_truncate: u64,
+}
+
+#[derive(Serialize)]
+struct HnswParamsResp {
+    m: usize,
+    ef_construction: usize,
+    ef_search: usize,
 }
 
 async fn collection_info(
@@ -337,11 +346,14 @@ async fn collection_info(
         Metric::Euclidean => "euclidean",
     };
     let stats = coll.wal_stats();
+    let (index, hnsw) = describe_index(&coll);
     Ok(Json(CollectionInfoResp {
         name,
         dim: coll.dim(),
         metric: metric.to_string(),
         len: coll.len(),
+        index,
+        hnsw,
         wal_size_bytes: stats.size_bytes,
         wal_last_truncate: stats.last_truncate.and_then(format_system_time),
         wal_bytes_since_truncate: stats.bytes_since_truncate,
@@ -359,11 +371,14 @@ async fn list_collections(
             Metric::Euclidean => "euclidean",
         };
         let stats = coll.wal_stats();
+        let (index, hnsw) = describe_index(coll);
         out.push(CollectionInfoResp {
             name: name.clone(),
             dim: coll.dim(),
             metric: metric.to_string(),
             len: coll.len(),
+            index,
+            hnsw,
             wal_size_bytes: stats.size_bytes,
             wal_last_truncate: stats.last_truncate.and_then(format_system_time),
             wal_bytes_since_truncate: stats.bytes_since_truncate,
@@ -393,6 +408,23 @@ async fn snapshot_collection(
 
 fn int_err<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+fn describe_index(coll: &Collection<AnyIndex>) -> (String, Option<HnswParamsResp>) {
+    coll.with_index(|idx| match idx {
+        AnyIndex::Bruteforce(_) => ("bruteforce".to_string(), None),
+        AnyIndex::Hnsw(h) => {
+            let params = h.params();
+            (
+                "hnsw".to_string(),
+                Some(HnswParamsResp {
+                    m: params.m,
+                    ef_construction: params.ef_construction,
+                    ef_search: params.ef_search,
+                }),
+            )
+        }
+    })
 }
 
 #[derive(Deserialize)]

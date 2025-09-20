@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 
 struct SidebarView: View {
     @EnvironmentObject var model: AppModel
@@ -9,18 +10,26 @@ struct SidebarView: View {
                 ConnectionView()
             }
             Section("Collections") {
+                if model.collections.isEmpty && !model.isRefreshing {
+                    Text("No collections yet").foregroundStyle(.secondary)
+                }
                 ForEach(model.collections) { c in
-                    Text("\(c.name) • \(c.len)")
-                        .tag(Optional(c))
-                        .onTapGesture { model.selection = c }
+                    VStack(alignment: .leading) {
+                        Text(c.name)
+                        Text("Vectors: \(c.len)").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .tag(Optional(c))
+                    .onTapGesture { model.selection = c }
                 }
             }
         }
         .toolbar {
+            Button {
+                Task { await model.refreshAll() }
+            } label: { Label("Refresh", systemImage: "arrow.clockwise") }
             Button { showingCreate = true } label: { Label("New", systemImage: "plus") }
         }
         .sheet(isPresented: $showingCreate) { CreateCollectionView(isPresented: $showingCreate) }
-        .task { await model.refreshHealth(); await model.loadCollections() }
     }
 }
 
@@ -29,17 +38,38 @@ struct ConnectionView: View {
     @State private var base = "http://127.0.0.1:8080"
     @State private var checking = false
     var body: some View {
-        HStack(spacing: 8) {
-            TextField("Server URL", text: $base).textFieldStyle(.roundedBorder)
-            Button(checking ? "Checking…" : "Check") {
-                checking = true
-                Task { @MainActor in
-                    model.baseURL = URL(string: base)
-                    await model.refreshHealth()
-                    await model.loadCollections()
-                    checking = false
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                TextField("Server URL", text: $base)
+                    .textFieldStyle(.roundedBorder)
+                    .textInputAutocapitalization(.never)
+                    .disableAutocorrection(true)
+                Button(checking ? "Updating…" : "Save & Refresh") {
+                    checking = true
+                    Task {
+                        model.updateBaseURL(base)
+                        await model.refreshAll()
+                        await MainActor.run {
+                            checking = false
+                            model.clearError()
+                        }
+                    }
                 }
+                .disabled(checking || base.isEmpty)
             }
+            HStack {
+                Toggle("Auto refresh", isOn: $model.autoRefreshEnabled)
+                Spacer()
+                Stepper(value: $model.autoRefreshInterval, in: 5...120, step: 5) {
+                    Text("Every \(Int(model.autoRefreshInterval))s")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(width: 140)
+            }
+        }
+        .onAppear {
+            base = model.baseURLText
         }
     }
 }
@@ -94,9 +124,9 @@ struct CreateCollectionView: View {
 }
 
 struct CollectionDetailView: View {
-    let collection: CollectionInfo
     @EnvironmentObject var model: AppModel
-    @State private var efSearch = 50
+    @State private var detail: CollectionInfo
+    @State private var efSearch: Int
     @State private var vectorText = "[0.1, 0.2, 0.3]"
     @State private var topK = 5
     @State private var results: [SearchResult] = []
@@ -104,92 +134,243 @@ struct CollectionDetailView: View {
     @State private var notice: String?
     @State private var showBatchIngest = false
     @State private var filters: [FilterEntry] = []
+    @State private var selectedResult: SearchResult?
+    @State private var metricsText: String = ""
+    @State private var showingMetrics = false
+
+    init(collection: CollectionInfo) {
+        _detail = State(initialValue: collection)
+        _efSearch = State(initialValue: collection.hnsw?.efSearch ?? 50)
+    }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack { Text("Collection:").bold(); Text(collection.name) }
-                HStack { Text("Dim:").bold(); Text("\(collection.dim)") }
-                HStack { Text("Metric:").bold(); Text(collection.metric) }
-                HStack { Text("Size:").bold(); Text("\(collection.len)") }
-                Divider()
+            VStack(alignment: .leading, spacing: 16) {
+                GroupBox("Schema") {
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+                        GridRow { Text("Name").bold(); Text(detail.name) }
+                        GridRow { Text("Metric").bold(); Text(detail.metric) }
+                        GridRow { Text("Dimension").bold(); Text("\(detail.dim)") }
+                        GridRow { Text("Index").bold(); Text(detail.index.capitalized) }
+                        if let hnsw = detail.hnsw {
+                            GridRow { Text("HNSW M").bold(); Text("\(hnsw.m)") }
+                            GridRow { Text("ef_construction").bold(); Text("\(hnsw.efConstruction)") }
+                            GridRow { Text("ef_search").bold(); Text("\(hnsw.efSearch)") }
+                        }
+                        GridRow { Text("Vectors").bold(); Text("\(detail.len)") }
+                    }
+                    .font(.subheadline)
+                }
+
+                GroupBox("WAL & Metrics") {
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+                        GridRow { Text("Size Bytes").bold(); Text(ByteCountFormatter.string(fromByteCount: Int64(detail.walSizeBytes), countStyle: .decimal)) }
+                        GridRow { Text("Bytes Since Truncate").bold(); Text("\(detail.walBytesSinceTruncate)") }
+                        GridRow { Text("Last Truncate").bold(); Text(detail.walLastTruncate ?? "n/a") }
+                    }
+                    .font(.subheadline)
+                }
+
                 HStack(spacing: 12) {
-                    Button(busy ? "Snapshot…" : "Snapshot") { actionSnapshot() }
-                    Button(busy ? "Compact…" : "Compact") { actionCompact() }
-                    HStack { Text("ef_search"); TextField("", value: $efSearch, formatter: NumberFormatter()).frame(width: 80); Button("Update") { actionUpdateParams() } }
-                    Spacer()
+                    Button(action: actionSnapshot) {
+                        Label("Snapshot", systemImage: "tray.and.arrow.down")
+                    }
+                    .disabled(busy)
+
+                    Button(action: actionCompact) {
+                        Label("Compact", systemImage: "hammer")
+                    }
+                    .disabled(busy)
+
+                    if detail.index == "hnsw" {
+                        HStack(spacing: 8) {
+                            Text("ef_search")
+                            TextField("", value: $efSearch, formatter: NumberFormatter())
+                                .frame(width: 80)
+                            Button("Update", action: actionUpdateParams)
+                                .disabled(busy)
+                        }
+                    }
+
+                    Spacer(minLength: 12)
+
+                    Button("Metrics", action: actionMetrics)
                     Button("Batch Ingest") { showBatchIngest = true }
                 }
+
                 Divider()
-                VStack(alignment: .leading, spacing: 8) {
+
+                VStack(alignment: .leading, spacing: 10) {
                     Text("Search").font(.headline)
-                    TextField("[floats]", text: $vectorText).textFieldStyle(.roundedBorder)
-                    HStack { Text("top_k"); TextField("", value: $topK, formatter: NumberFormatter()).frame(width: 80) }
+                    HStack(spacing: 8) {
+                        TextField("[floats]", text: $vectorText)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                        if !model.recentVectors.isEmpty {
+                            Menu {
+                                ForEach(model.recentVectors, id: \.self) { v in
+                                    Button(v) { vectorText = v }
+                                }
+                            } label: {
+                                Image(systemName: "clock.arrow.circlepath")
+                            }
+                        }
+                    }
+                    HStack(spacing: 12) {
+                        Stepper(value: $topK, in: 1...100) {
+                            Text("top_k: \(topK)")
+                        }
+                        Spacer()
+                    }
                     FilterBuilderView(entries: $filters)
-                    Button(busy ? "Searching…" : "Search") { actionSearch() }
+                    HStack {
+                        Button(busy ? "Searching…" : "Search", action: actionSearch)
+                            .buttonStyle(.borderedProminent)
+                            .disabled(busy)
+                        Spacer()
+                    }
                     if !results.isEmpty {
                         Table(results) {
-                            TableColumn("ID") { Text($0.id.uuidString.prefix(8) + "…") }
-                            TableColumn("Score") { Text(String(format: "%.4f", $0.score)) }
+                            TableColumn("ID") { result in
+                                Text(result.id.uuidString.prefix(8) + "…")
+                                    .onTapGesture { selectedResult = result }
+                            }
+                            TableColumn("Score") { result in
+                                Text(String(format: "%.4f", result.score))
+                            }
                         }
                         .frame(minHeight: 160)
                     }
                 }
+
                 if let n = notice { Text(n).foregroundStyle(.secondary) }
             }
             .padding()
         }
-        .navigationTitle(collection.name)
+        .navigationTitle(detail.name)
         .sheet(isPresented: $showBatchIngest) {
-            BatchIngestView(isPresented: $showBatchIngest, collection: collection)
+            BatchIngestView(isPresented: $showBatchIngest, collection: detail)
                 .environmentObject(model)
         }
-    }
-
-    func actionSnapshot() {
-        busy = true
-        Task {
-            do { try await model.client.snapshot(name: collection.name); await MainActor.run { notice = "Snapshot written." } }
-            catch { await MainActor.run { notice = error.localizedDescription } }
-            busy = false
+        .sheet(item: $selectedResult) { PayloadDetailView(result: $0) }
+        .sheet(isPresented: $showingMetrics) {
+            MetricsSheet(text: metricsText, title: detail.name)
+        }
+        .overlay {
+            if busy {
+                ProgressOverlay()
+            }
+        }
+        .task(id: detail.id) {
+            if let updated = await model.fetchCollectionDetail(name: detail.name) {
+                await MainActor.run {
+                    detail = updated
+                    if let h = updated.hnsw {
+                        efSearch = h.efSearch
+                    }
+                }
+            }
         }
     }
 
-    func actionCompact() {
+    private func actionSnapshot() {
         busy = true
         Task {
-            do { let ok = try await model.client.compact(name: collection.name); await MainActor.run { notice = ok ? "Compacted HNSW." : "No-op (BruteForce)." } }
-            catch { await MainActor.run { notice = error.localizedDescription } }
-            busy = false
-        }
-    }
-
-    func actionUpdateParams() {
-        Task {
-            do { let ok = try await model.client.updateEfSearch(name: collection.name, ef: efSearch); await MainActor.run { notice = ok ? "ef_search updated." : "No-op (BruteForce)." } }
-            catch { await MainActor.run { notice = error.localizedDescription } }
-        }
-    }
-
-    func actionSearch() {
-        busy = true
-        Task {
+            defer { busy = false }
             do {
-                guard let vec = try? JSONSerialization.jsonObject(with: Data(vectorText.utf8)) as? [Double] else { throw NSError(domain: "AIDB", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid vector JSON"]) }
-                let f = vec.map { Float($0) }
+                try await model.client.snapshot(name: detail.name)
+                await MainActor.run { notice = "Snapshot written." }
+                await reloadDetail()
+            } catch {
+                await MainActor.run { notice = error.localizedDescription }
+            }
+        }
+    }
+
+    private func actionCompact() {
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                let ok = try await model.client.compact(name: detail.name)
+                await MainActor.run { notice = ok ? "Compacted HNSW." : "No-op (BruteForce)." }
+                await reloadDetail()
+            } catch {
+                await MainActor.run { notice = error.localizedDescription }
+            }
+        }
+    }
+
+    private func actionUpdateParams() {
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                let ok = try await model.client.updateEfSearch(name: detail.name, ef: efSearch)
+                await MainActor.run { notice = ok ? "ef_search updated." : "No-op (BruteForce)." }
+                await reloadDetail()
+            } catch {
+                await MainActor.run { notice = error.localizedDescription }
+            }
+        }
+    }
+
+    private func actionSearch() {
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                guard let vec = try? JSONSerialization.jsonObject(with: Data(vectorText.utf8)) as? [Double] else {
+                    throw NSError(domain: "AIDB", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid vector JSON"])
+                }
+                let floats = vec.map { Float($0) }
                 var filt: [String: AnyCodable]? = nil
                 if !filters.isEmpty {
-                    var m: [String: AnyCodable] = [:]
-                    for e in filters where !e.key.isEmpty {
-                        if let v = parseJSONFragment(e.value) { m[e.key] = toAnyCodable(v) }
-                        else { m[e.key] = AnyCodable(e.value) }
+                    var map: [String: AnyCodable] = [:]
+                    for entry in filters where !entry.key.isEmpty {
+                        if let fragment = parseJSONFragment(entry.value) {
+                            map[entry.key] = toAnyCodable(fragment)
+                        } else {
+                            map[entry.key] = AnyCodable(entry.value)
+                        }
                     }
-                    filt = m
+                    filt = map
                 }
-                let res = try await model.client.search(name: collection.name, vector: f, topK: topK, filter: filt)
-                await MainActor.run { self.results = res }
-            } catch { await MainActor.run { notice = error.localizedDescription } }
-            busy = false
+                let res = try await model.client.search(name: detail.name, vector: floats, topK: topK, filter: filt)
+                await MainActor.run {
+                    self.results = res
+                    self.notice = "Found \(res.count) results."
+                }
+                model.rememberVector(vectorText)
+            } catch {
+                await MainActor.run { notice = error.localizedDescription }
+            }
+        }
+    }
+
+    private func actionMetrics() {
+        metricsText = ""
+        Task {
+            do {
+                let metrics = try await model.client.metrics()
+                await MainActor.run {
+                    metricsText = metrics
+                    showingMetrics = true
+                }
+            } catch {
+                await MainActor.run { notice = error.localizedDescription }
+            }
+        }
+    }
+
+    private func reloadDetail() async {
+        if let updated = await model.fetchCollectionDetail(name: detail.name) {
+            await MainActor.run {
+                detail = updated
+                if let h = updated.hnsw {
+                    efSearch = h.efSearch
+                }
+            }
         }
     }
 }
@@ -244,6 +425,7 @@ struct BatchIngestView: View {
                 }
                 let ids = try await model.client.upsertBatch(name: collection.name, points: points)
                 await MainActor.run { self.message = "Ingested \(ids.count) points." }
+                await model.fetchCollectionDetail(name: collection.name)
             } catch { await MainActor.run { self.message = error.localizedDescription } }
             busy = false
         }
@@ -272,5 +454,78 @@ struct FilterBuilderView: View {
     private func binding(for entry: FilterEntry) -> (key: Binding<String>, value: Binding<String>) {
         let i = entries.firstIndex(of: entry)!
         return (Binding(get: { entries[i].key }, set: { entries[i].key = $0 }), Binding(get: { entries[i].value }, set: { entries[i].value = $0 }))
+    }
+}
+
+struct ErrorBanner: View {
+    let message: String
+    var body: some View {
+        Text(message)
+            .padding(.vertical, 8)
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity)
+            .background(Color.red.opacity(0.9))
+            .foregroundStyle(.white)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .padding(.horizontal)
+    }
+}
+
+struct ProgressOverlay: View {
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.15).ignoresSafeArea()
+            ProgressView().progressViewStyle(.circular)
+        }
+    }
+}
+
+struct PayloadDetailView: View {
+    let result: SearchResult
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Result Detail").font(.title2)
+            Text("ID: \(result.id.uuidString)").font(.callout)
+            Text(String(format: "Score: %.4f", result.score)).font(.callout)
+            Divider()
+            ScrollView {
+                Text(prettyPayload())
+                    .font(.system(.body, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(minHeight: 200)
+            Spacer()
+        }
+        .padding(24)
+        .frame(minWidth: 420, minHeight: 320)
+    }
+
+    private func prettyPayload() -> String {
+        guard let payload = result.payload,
+              let data = try? JSONEncoder().encode(payload),
+              let obj = try? JSONSerialization.jsonObject(with: data),
+              let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
+              let string = String(data: pretty, encoding: .utf8) else {
+            return "<empty payload>"
+        }
+        return string
+    }
+}
+
+struct MetricsSheet: View {
+    let text: String
+    let title: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Metrics for \(title)").font(.title3)
+            ScrollView {
+                Text(text.isEmpty ? "No metrics available." : text)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(minHeight: 240)
+        }
+        .padding(24)
+        .frame(minWidth: 520, minHeight: 360)
     }
 }

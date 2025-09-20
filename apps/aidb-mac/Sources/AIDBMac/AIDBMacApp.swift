@@ -15,19 +15,36 @@ struct AIDBMacApp: App {
 struct RootView: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
-        NavigationSplitView {
-            SidebarView()
-        } detail: {
-            if let sel = model.selection {
-                CollectionDetailView(collection: sel)
-            } else {
-                VStack(spacing: 12) {
-                    Text("AIDB Mac UI").font(.largeTitle)
-                    ConnectionView()
-                    if model.healthOK { Text("Server: healthy").foregroundStyle(.green) }
+        ZStack(alignment: .top) {
+            NavigationSplitView {
+                SidebarView()
+            } detail: {
+                if let sel = model.selection {
+                    CollectionDetailView(collection: sel)
+                } else {
+                    VStack(spacing: 12) {
+                        Text("AIDB Mac UI").font(.largeTitle)
+                        ConnectionView()
+                        if model.healthOK { Text("Server: healthy").foregroundStyle(.green) }
+                    }
+                    .padding()
                 }
-                .padding()
             }
+            if let message = model.errorMessage {
+                ErrorBanner(message: message)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .padding(.top, 8)
+            }
+            if model.isRefreshing {
+                ProgressOverlay()
+            }
+        }
+        .task(id: model.baseURL) {
+            await model.refreshAll()
+            model.startAutoRefresh()
+        }
+        .onDisappear {
+            model.stopAutoRefresh()
         }
     }
 }
