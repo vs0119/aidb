@@ -221,7 +221,13 @@ impl ProductQuantizer {
                 let query_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
                 let decoded = self.decode(code);
                 let code_norm: f32 = decoded.iter().map(|x| x * x).sum::<f32>().sqrt();
-                1.0 - (total_dist / (query_norm * code_norm))
+                if query_norm <= f32::EPSILON || code_norm <= f32::EPSILON {
+                    1.0
+                } else {
+                    let denom = query_norm * code_norm;
+                    let cosine_sim = (total_dist / denom).clamp(-1.0, 1.0);
+                    1.0 - cosine_sim
+                }
             }
         }
     }
@@ -287,7 +293,11 @@ impl ScalarQuantizer {
         // Calculate scaling factors
         for i in 0..self.dim {
             let range = self.max_vals[i] - self.min_vals[i];
-            self.scale[i] = if range > 0.0 { 255.0 / range } else { 1.0 };
+            self.scale[i] = if range > f32::EPSILON {
+                255.0 / range
+            } else {
+                0.0
+            };
         }
 
         self.trained = true;
@@ -301,8 +311,16 @@ impl ScalarQuantizer {
             .iter()
             .enumerate()
             .map(|(i, &val)| {
-                let normalized = (val - self.min_vals[i]) * self.scale[i];
-                normalized.clamp(0.0, 255.0) as u8
+                if self.scale[i] == 0.0 {
+                    if val <= self.min_vals[i] {
+                        0
+                    } else {
+                        u8::MAX
+                    }
+                } else {
+                    let normalized = (val - self.min_vals[i]) * self.scale[i];
+                    normalized.clamp(0.0, 255.0) as u8
+                }
             })
             .collect();
 
@@ -313,7 +331,13 @@ impl ScalarQuantizer {
         code.codes
             .iter()
             .enumerate()
-            .map(|(i, &c)| self.min_vals[i] + (c as f32) / self.scale[i])
+            .map(|(i, &c)| {
+                if self.scale[i] == 0.0 {
+                    self.min_vals[i]
+                } else {
+                    self.min_vals[i] + (c as f32) / self.scale[i]
+                }
+            })
             .collect()
     }
 
@@ -328,25 +352,12 @@ impl ScalarQuantizer {
     fn simd_l2_distance(&self, query: &[f32], code: &SQCode) -> f32 {
         let mut sum = 0.0f32;
 
-        // Process 8 dimensions at a time using SIMD
-        let chunks = query.chunks_exact(8);
-        let code_chunks = code.codes.chunks_exact(8);
-
-        for (q_chunk, c_chunk) in chunks.clone().zip(code_chunks.clone()) {
-            for (i, (&q_val, &c_val)) in q_chunk.iter().zip(c_chunk.iter()).enumerate() {
-                let dim_idx = (q_chunk.as_ptr() as usize - query.as_ptr() as usize) / 4 + i;
-                let decoded_val = self.min_vals[dim_idx] + (c_val as f32) / self.scale[dim_idx];
-                let diff = q_val - decoded_val;
-                sum += diff * diff;
-            }
-        }
-
-        // Handle remainder
-        let remainder_q = chunks.remainder();
-        let remainder_c = code_chunks.remainder();
-        for (i, (&q_val, &c_val)) in remainder_q.iter().zip(remainder_c.iter()).enumerate() {
-            let dim_idx = query.len() - remainder_q.len() + i;
-            let decoded_val = self.min_vals[dim_idx] + (c_val as f32) / self.scale[dim_idx];
+        for (i, (&q_val, &c_val)) in query.iter().zip(code.codes.iter()).enumerate() {
+            let decoded_val = if self.scale[i] == 0.0 {
+                self.min_vals[i]
+            } else {
+                self.min_vals[i] + (c_val as f32) / self.scale[i]
+            };
             let diff = q_val - decoded_val;
             sum += diff * diff;
         }
@@ -360,16 +371,21 @@ impl ScalarQuantizer {
         let mut norm_c = 0.0f32;
 
         for (i, (&q_val, &c_val)) in query.iter().zip(code.codes.iter()).enumerate() {
-            let decoded_val = self.min_vals[i] + (c_val as f32) / self.scale[i];
+            let decoded_val = if self.scale[i] == 0.0 {
+                self.min_vals[i]
+            } else {
+                self.min_vals[i] + (c_val as f32) / self.scale[i]
+            };
             dot += q_val * decoded_val;
             norm_q += q_val * q_val;
             norm_c += decoded_val * decoded_val;
         }
 
-        if norm_q == 0.0 || norm_c == 0.0 {
+        if norm_q <= f32::EPSILON || norm_c <= f32::EPSILON {
             1.0
         } else {
-            1.0 - (dot / (norm_q.sqrt() * norm_c.sqrt()))
+            let cosine_sim = (dot / (norm_q.sqrt() * norm_c.sqrt())).clamp(-1.0, 1.0);
+            1.0 - cosine_sim
         }
     }
 }

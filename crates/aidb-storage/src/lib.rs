@@ -336,6 +336,10 @@ impl Wal {
     pub(crate) fn size_bytes(&self) -> Result<u64, StorageError> {
         self.inner.size_bytes()
     }
+
+    pub(crate) fn flush(&self) -> Result<(), StorageError> {
+        self.inner.flush()
+    }
 }
 
 impl WalInner {
@@ -530,6 +534,7 @@ impl<I: VectorIndex> Collection<I> {
             vector: vector.clone(),
             payload: payload.clone(),
         })?;
+        self.wal.flush()?;
         self.refresh_wal_stats()?;
         self.index.write().add(id, vector, payload);
         Ok(())
@@ -538,6 +543,7 @@ impl<I: VectorIndex> Collection<I> {
     pub fn remove(&self, id: Id) -> Result<bool, StorageError> {
         let _guard = self.wal_lock.lock();
         self.wal.append(&WalOp::Remove { id })?;
+        self.wal.flush()?;
         self.refresh_wal_stats()?;
         Ok(self.index.write().remove(&id))
     }

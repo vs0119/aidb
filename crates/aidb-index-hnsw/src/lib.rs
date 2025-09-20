@@ -313,15 +313,19 @@ impl HnswIndex {
 impl VectorIndex for HnswIndex {
     fn add(&mut self, id: Id, vector: Vector, payload: Option<JsonValue>) {
         debug_assert_eq!(vector.len(), self.dim);
+        let mut needs_entry_refresh = false;
         if let Some(&idx) = self.id_to_idx.get(&id) {
             // Prefer remove+reinsert to maintain graph quality
             self.nodes[idx].deleted = true;
+            if self.entry_point == Some(idx) {
+                needs_entry_refresh = true;
+            }
         }
 
         let mut rng = rand::thread_rng();
         let level = self.random_level(&mut rng);
         let idx = self.nodes.len();
-        let mut node = Node {
+        let node = Node {
             id,
             vector,
             payload,
@@ -360,35 +364,25 @@ impl VectorIndex for HnswIndex {
             }
         }
 
+        self.nodes.push(node);
+        self.id_to_idx.insert(id, idx);
+
         // From min(level, max_level) down to 0, perform ef_construction search and connect
         let start_level = std::cmp::min(level, self.max_level);
         for l in (0..=start_level).rev() {
             let neighs = with_candidate_buf(|buf| {
                 buf.extend(
-                    self.search_layer(&node.vector, ep, self.params.ef_construction, l)
+                    self.search_layer(&self.nodes[idx].vector, ep, self.params.ef_construction, l)
                         .into_iter()
                         .filter(|(i, _)| !self.nodes[*i].deleted),
                 );
                 self.select_neighbors(buf, self.params.m)
             });
 
-            // Insert node index placeholder to reference soon
-            // (We push after linking to ensure idx exists in self.nodes)
-            self.id_to_idx.insert(id, idx);
-
-            // push so that references are valid
-            if self.nodes.len() == idx {
-                self.nodes.push(node);
-            } else {
-                self.nodes[idx] = node;
-            }
-
-            // link
             for &n in &neighs {
                 self.link_bidirectional(idx, n, l);
             }
 
-            // set ep for next lower layer as the closest among neighs or current ep
             if !neighs.is_empty() {
                 ep = *neighs
                     .iter()
@@ -401,14 +395,13 @@ impl VectorIndex for HnswIndex {
                     })
                     .unwrap();
             }
-
-            // Prepare node for next loop iteration
-            node = self.nodes[idx].clone();
         }
 
         if level > self.max_level {
             self.entry_point = Some(idx);
             self.max_level = level;
+        } else if needs_entry_refresh {
+            self.refresh_entry_point();
         }
     }
 
@@ -490,6 +483,22 @@ impl VectorIndex for HnswIndex {
 }
 
 impl HnswIndex {
+    fn refresh_entry_point(&mut self) {
+        if let Some((idx, node)) = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| !node.deleted)
+            .max_by_key(|(_, node)| node.level)
+        {
+            self.entry_point = Some(idx);
+            self.max_level = node.level;
+        } else {
+            self.entry_point = None;
+            self.max_level = 0;
+        }
+    }
+
     pub fn rebuild(&mut self) {
         let mut fresh = HnswIndex::new(self.dim, self.metric, self.params.clone());
         // Preserve entry point by re-adding all non-deleted nodes

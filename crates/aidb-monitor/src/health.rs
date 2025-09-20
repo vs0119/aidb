@@ -71,7 +71,7 @@ impl HealthCheckEngine {
         }
     }
 
-    async fn initialize_default_checks(&self) {
+    pub async fn initialize_default_checks(&self) {
         let mut checks = self.checker.checks.write();
         checks.clear();
 

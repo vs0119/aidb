@@ -725,24 +725,25 @@ impl SqlDatabase {
     ) -> Result<QueryResult, SqlDatabaseError> {
         let cte_tables = self.materialize_ctes(&ctes)?;
 
-        let source_table = if let Some(table) = cte_tables.get(&merge.source.name) {
-            Table {
+        let clone_table = |table: &Table| {
+            let mut clone = Table {
                 columns: table.columns.clone(),
                 rows: table.rows.clone(),
-                partitioning: None,
-                partitions: BTreeMap::new(),
-            }
+                ..Table::default()
+            };
+            initialize_secondary_indexes(&mut clone);
+            rebuild_secondary_indexes(&mut clone);
+            clone
+        };
+
+        let source_table = if let Some(table) = cte_tables.get(&merge.source.name) {
+            clone_table(table)
         } else {
             let table = self
                 .tables
                 .get(&merge.source.name)
                 .ok_or_else(|| SqlDatabaseError::UnknownTable(merge.source.name.clone()))?;
-            Table {
-                columns: table.columns.clone(),
-                rows: table.rows.clone(),
-                partitioning: None,
-                partitions: BTreeMap::new(),
-            }
+            clone_table(table)
         };
 
         let target_name = merge.target.name.clone();
@@ -1457,7 +1458,7 @@ fn parse_insert(input: &str) -> Result<Statement, SqlDatabaseError> {
         let (values_raw, rest) = take_parenthesized(remainder)?;
         let values = split_comma(&values_raw)?
             .into_iter()
-            .map(|s| parse_value(&s))
+            .map(|s| parse_literal(&s))
             .collect::<Result<Vec<_>, _>>()?;
         rows.push(values);
         remainder = rest.trim_start();
@@ -1543,6 +1544,10 @@ fn parse_literal_token(input: &str) -> Result<(Value, &str), SqlDatabaseError> {
         let geometry = value_into_geometry(inner)?;
         return Ok((Value::Geometry(geometry), remainder));
     }
+    if let Some(geometry) = parse_geometry_literal(trimmed) {
+        let rest = &trimmed[trimmed.len()..];
+        return Ok((Value::Geometry(geometry), rest));
+    }
     if trimmed.starts_with('\'') {
         let mut escaped = false;
         for (idx, byte) in trimmed.as_bytes().iter().enumerate().skip(1) {
@@ -1590,6 +1595,16 @@ fn parse_literal_token(input: &str) -> Result<(Value, &str), SqlDatabaseError> {
     }
 }
 
+fn parse_literal(input: &str) -> Result<Value, SqlDatabaseError> {
+    let (value, rest) = parse_literal_token(input)?;
+    if !rest.trim().is_empty() {
+        return Err(SqlDatabaseError::Parse(
+            "unexpected trailing tokens after literal".into(),
+        ));
+    }
+    Ok(value)
+}
+
 fn parse_properties_clause(
     input: &str,
 ) -> Result<(HashMap<String, Value>, &str), SqlDatabaseError> {
@@ -1616,7 +1631,7 @@ fn parse_properties_map(raw: &str) -> Result<HashMap<String, Value>, SqlDatabase
                 "property keys cannot be empty".into(),
             ));
         }
-        let value = parse_value(value_str.trim())?;
+        let value = parse_literal(value_str.trim())?;
         props.insert(key.to_string(), value);
     }
     Ok(props)
@@ -1629,7 +1644,7 @@ fn value_to_string(value: Value, context: &str) -> Result<String, SqlDatabaseErr
         Value::Float(f) => Ok(f.to_string()),
         Value::Boolean(b) => Ok(b.to_string()),
         Value::Timestamp(ts) => Ok(ts.to_rfc3339()),
-        Value::Json(v) | Value::Jsonb(v) => serde_json::to_string(v)
+        Value::Json(v) | Value::Jsonb(v) => serde_json::to_string(&v)
             .map_err(|_| SqlDatabaseError::Parse(format!("failed to serialize {context}"))),
         Value::Xml(s) => Ok(s),
         Value::Geometry(g) => Ok(geometry_to_string(&g)),
@@ -2178,7 +2193,7 @@ fn parse_merge_value<'a>(
     }
     let upper = ident.to_ascii_uppercase();
     if matches!(upper.as_str(), "NULL" | "TRUE" | "FALSE") {
-        let value = parse_value(ident.as_str())?;
+        let value = parse_literal(ident.as_str())?;
         return Ok((MergeValue::Literal(value), rest_trimmed));
     }
     Ok((
@@ -2422,7 +2437,7 @@ fn parse_geometry_literal(text: &str) -> Option<Geometry> {
     if upper.starts_with("POINT(") && trimmed.ends_with(')') {
         let inner = &trimmed[6..trimmed.len() - 1];
         let parts: Vec<_> = inner
-            .split(|c| c == ',' || c.is_whitespace())
+            .split(|c: char| c == ',' || c.is_whitespace())
             .filter(|part| !part.is_empty())
             .collect();
         if parts.len() != 2 {
@@ -3070,6 +3085,9 @@ fn coerce_value(value: Value, target: ColumnType) -> Result<Value, SqlDatabaseEr
             Value::Timestamp(_) => Err(SqlDatabaseError::SchemaMismatch(
                 "cannot coerce TIMESTAMP to INTEGER".into(),
             )),
+            Value::Json(_) | Value::Jsonb(_) | Value::Xml(_) | Value::Geometry(_) => Err(
+                SqlDatabaseError::SchemaMismatch("cannot coerce complex types to INTEGER".into()),
+            ),
         },
         ColumnType::Float => match value {
             Value::Integer(i) => Ok(Value::Float(i as f64)),
@@ -3082,6 +3100,9 @@ fn coerce_value(value: Value, target: ColumnType) -> Result<Value, SqlDatabaseEr
             Value::Timestamp(_) => Err(SqlDatabaseError::SchemaMismatch(
                 "cannot coerce TIMESTAMP to FLOAT".into(),
             )),
+            Value::Json(_) | Value::Jsonb(_) | Value::Xml(_) | Value::Geometry(_) => Err(
+                SqlDatabaseError::SchemaMismatch("cannot coerce complex types to FLOAT".into()),
+            ),
         },
         ColumnType::Text => match value {
             Value::Text(s) => Ok(Value::Text(s)),
@@ -3090,6 +3111,15 @@ fn coerce_value(value: Value, target: ColumnType) -> Result<Value, SqlDatabaseEr
             Value::Boolean(b) => Ok(Value::Text(b.to_string())),
             Value::Null => Ok(Value::Null),
             Value::Timestamp(ts) => Ok(Value::Text(ts.to_rfc3339())),
+            Value::Json(v) | Value::Jsonb(v) => {
+                serde_json::to_string(&v).map(Value::Text).map_err(|_| {
+                    SqlDatabaseError::SchemaMismatch(
+                        "failed to serialize JSON value as TEXT".into(),
+                    )
+                })
+            }
+            Value::Xml(s) => Ok(Value::Text(s)),
+            Value::Geometry(g) => Ok(Value::Text(geometry_to_string(&g))),
         },
         ColumnType::Boolean => match value {
             Value::Boolean(b) => Ok(Value::Boolean(b)),
@@ -3106,6 +3136,9 @@ fn coerce_value(value: Value, target: ColumnType) -> Result<Value, SqlDatabaseEr
             Value::Timestamp(_) => Err(SqlDatabaseError::SchemaMismatch(
                 "cannot coerce TIMESTAMP to BOOLEAN".into(),
             )),
+            Value::Json(_) | Value::Jsonb(_) | Value::Xml(_) | Value::Geometry(_) => Err(
+                SqlDatabaseError::SchemaMismatch("cannot coerce complex types to BOOLEAN".into()),
+            ),
         },
         ColumnType::Timestamp => match value {
             Value::Timestamp(ts) => Ok(Value::Timestamp(ts)),
