@@ -4,6 +4,9 @@ use std::ops::Bound::Included;
 
 use chrono::Datelike;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use roxmltree::Document;
+use rstar::{PointDistance, RTree, RTreeObject, AABB};
+use serde_json::Value as JsonValue;
 
 use thiserror::Error;
 
@@ -14,6 +17,10 @@ pub enum Value {
     Text(String),
     Boolean(bool),
     Timestamp(DateTime<Utc>),
+    Json(JsonValue),
+    Jsonb(JsonValue),
+    Xml(String),
+    Geometry(Geometry),
     Null,
 }
 
@@ -30,14 +37,100 @@ enum ColumnType {
     Text,
     Boolean,
     Timestamp,
+    Json,
+    Jsonb,
+    Xml,
+    Geometry,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct Table {
     columns: Vec<Column>,
     rows: Vec<Vec<Value>>,
     partitioning: Option<TimePartitioning>,
     partitions: BTreeMap<PartitionKey, Vec<usize>>,
+    json_indexes: HashMap<usize, JsonIndex>,
+    jsonb_indexes: HashMap<usize, JsonIndex>,
+    xml_indexes: HashMap<usize, XmlIndex>,
+    spatial_indexes: HashMap<usize, SpatialIndex>,
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            partitioning: None,
+            partitions: BTreeMap::new(),
+            json_indexes: HashMap::new(),
+            jsonb_indexes: HashMap::new(),
+            xml_indexes: HashMap::new(),
+            spatial_indexes: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Geometry {
+    Point {
+        x: f64,
+        y: f64,
+    },
+    BoundingBox {
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    },
+}
+
+impl Geometry {
+    fn to_aabb(&self) -> AABB<[f64; 2]> {
+        match self {
+            Geometry::Point { x, y } => AABB::from_point([*x, *y]),
+            Geometry::BoundingBox {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            } => AABB::from_corners([*min_x, *min_y], [*max_x, *max_y]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct JsonIndex {
+    map: HashMap<String, Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct XmlIndex {
+    map: HashMap<String, Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SpatialIndex {
+    tree: RTree<SpatialIndexItem>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpatialIndexItem {
+    row: usize,
+    bbox: AABB<[f64; 2]>,
+}
+
+impl RTreeObject for SpatialIndexItem {
+    type Envelope = AABB<[f64; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        self.bbox
+    }
+}
+
+impl PointDistance for SpatialIndexItem {
+    fn distance_2(&self, point: &[f64; 2]) -> f64 {
+        self.bbox.distance_2(point)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -225,6 +318,7 @@ impl SqlDatabase {
         for (name, ty) in columns {
             table.columns.push(Column { name, ty });
         }
+        initialize_secondary_indexes(&mut table);
         if let Some(info) = partitioning {
             let column_index = table
                 .columns
@@ -293,6 +387,7 @@ impl SqlDatabase {
                     }
                 }
             }
+            update_indexes_for_row(table, row_index);
             inserted += 1;
         }
         Ok(inserted)
@@ -390,6 +485,71 @@ impl SqlDatabase {
                         | Predicate::InTableColumn { .. }
                         | Predicate::FullText { .. } => {}
                     }
+                }
+            }
+        }
+        if candidate_indices.is_none() {
+            if let Some(Predicate::Equals { column, value }) = predicate {
+                let idx = column_index_in_table(table, column)?;
+                match table.columns[idx].ty {
+                    ColumnType::Json => {
+                        if let Some(index) = table.json_indexes.get(&idx) {
+                            let coerced = coerce_static_value(value, ColumnType::Json)?;
+                            if let Value::Json(json) = coerced {
+                                let key = canonical_json(&json);
+                                if let Some(rows) = index.map.get(&key) {
+                                    candidate_indices = Some(rows.clone());
+                                } else {
+                                    candidate_indices = Some(Vec::new());
+                                }
+                            }
+                        }
+                    }
+                    ColumnType::Jsonb => {
+                        if let Some(index) = table.jsonb_indexes.get(&idx) {
+                            let coerced = coerce_static_value(value, ColumnType::Jsonb)?;
+                            if let Value::Jsonb(json) = coerced {
+                                let key = canonical_json(&json);
+                                if let Some(rows) = index.map.get(&key) {
+                                    candidate_indices = Some(rows.clone());
+                                } else {
+                                    candidate_indices = Some(Vec::new());
+                                }
+                            }
+                        }
+                    }
+                    ColumnType::Xml => {
+                        if let Some(index) = table.xml_indexes.get(&idx) {
+                            let coerced = coerce_static_value(value, ColumnType::Xml)?;
+                            if let Value::Xml(xml) = coerced {
+                                if let Some(root) = xml_root_name(&xml) {
+                                    if let Some(rows) = index.map.get(&root) {
+                                        candidate_indices = Some(rows.clone());
+                                    } else {
+                                        candidate_indices = Some(Vec::new());
+                                    }
+                                } else {
+                                    candidate_indices = Some(Vec::new());
+                                }
+                            }
+                        }
+                    }
+                    ColumnType::Geometry => {
+                        if let Some(index) = table.spatial_indexes.get(&idx) {
+                            let coerced = coerce_static_value(value, ColumnType::Geometry)?;
+                            if let Value::Geometry(geom) = coerced {
+                                let mut rows = Vec::new();
+                                let envelope = geom.to_aabb();
+                                for item in index.tree.locate_in_envelope_intersecting(&envelope) {
+                                    rows.push(item.row);
+                                }
+                                rows.sort_unstable();
+                                rows.dedup();
+                                candidate_indices = Some(rows);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -683,6 +843,9 @@ impl SqlDatabase {
 
         if modified && target_table.partitioning.is_some() {
             rebuild_partitions(target_table);
+        }
+        if modified {
+            rebuild_secondary_indexes(target_table);
         }
 
         Ok(QueryResult::None)
@@ -1348,6 +1511,38 @@ fn parse_literal_token(input: &str) -> Result<(Value, &str), SqlDatabaseError> {
     if trimmed.is_empty() {
         return Err(SqlDatabaseError::Parse("missing literal".into()));
     }
+    if let Some(rest) = strip_keyword_ci(trimmed, "JSONB") {
+        let (inner, remainder) = parse_literal_token(rest)?;
+        if matches!(inner, Value::Null) {
+            return Ok((Value::Null, remainder));
+        }
+        let json = value_into_json(inner)?;
+        return Ok((Value::Jsonb(normalize_json(json)), remainder));
+    }
+    if let Some(rest) = strip_keyword_ci(trimmed, "JSON") {
+        let (inner, remainder) = parse_literal_token(rest)?;
+        if matches!(inner, Value::Null) {
+            return Ok((Value::Null, remainder));
+        }
+        let json = value_into_json(inner)?;
+        return Ok((Value::Json(json), remainder));
+    }
+    if let Some(rest) = strip_keyword_ci(trimmed, "XML") {
+        let (inner, remainder) = parse_literal_token(rest)?;
+        if matches!(inner, Value::Null) {
+            return Ok((Value::Null, remainder));
+        }
+        let xml = value_into_xml(inner)?;
+        return Ok((Value::Xml(xml), remainder));
+    }
+    if let Some(rest) = strip_keyword_ci(trimmed, "GEOMETRY") {
+        let (inner, remainder) = parse_literal_token(rest)?;
+        if matches!(inner, Value::Null) {
+            return Ok((Value::Null, remainder));
+        }
+        let geometry = value_into_geometry(inner)?;
+        return Ok((Value::Geometry(geometry), remainder));
+    }
     if trimmed.starts_with('\'') {
         let mut escaped = false;
         for (idx, byte) in trimmed.as_bytes().iter().enumerate().skip(1) {
@@ -1434,6 +1629,10 @@ fn value_to_string(value: Value, context: &str) -> Result<String, SqlDatabaseErr
         Value::Float(f) => Ok(f.to_string()),
         Value::Boolean(b) => Ok(b.to_string()),
         Value::Timestamp(ts) => Ok(ts.to_rfc3339()),
+        Value::Json(v) | Value::Jsonb(v) => serde_json::to_string(v)
+            .map_err(|_| SqlDatabaseError::Parse(format!("failed to serialize {context}"))),
+        Value::Xml(s) => Ok(s),
+        Value::Geometry(g) => Ok(geometry_to_string(&g)),
         Value::Null => Err(SqlDatabaseError::Parse(
             format!("{context} cannot be NULL",),
         )),
@@ -2008,6 +2207,8 @@ fn table_from_rows(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Table {
     }
     table.columns = column_defs;
     table.rows = rows;
+    initialize_secondary_indexes(&mut table);
+    rebuild_secondary_indexes(&mut table);
     table
 }
 
@@ -2020,6 +2221,10 @@ fn infer_column_type(rows: &[Vec<Value>], index: usize) -> ColumnType {
                 Value::Text(_) => return ColumnType::Text,
                 Value::Boolean(_) => return ColumnType::Boolean,
                 Value::Timestamp(_) => return ColumnType::Timestamp,
+                Value::Json(_) => return ColumnType::Json,
+                Value::Jsonb(_) => return ColumnType::Jsonb,
+                Value::Xml(_) => return ColumnType::Xml,
+                Value::Geometry(_) => return ColumnType::Geometry,
                 Value::Null => continue,
             }
         }
@@ -2037,6 +2242,253 @@ fn rebuild_partitions(table: &mut Table) {
                 }
             }
         }
+    }
+}
+
+fn initialize_secondary_indexes(table: &mut Table) {
+    table.json_indexes.clear();
+    table.jsonb_indexes.clear();
+    table.xml_indexes.clear();
+    table.spatial_indexes.clear();
+    for (idx, column) in table.columns.iter().enumerate() {
+        match column.ty {
+            ColumnType::Json => {
+                table.json_indexes.insert(idx, JsonIndex::default());
+            }
+            ColumnType::Jsonb => {
+                table.jsonb_indexes.insert(idx, JsonIndex::default());
+            }
+            ColumnType::Xml => {
+                table.xml_indexes.insert(idx, XmlIndex::default());
+            }
+            ColumnType::Geometry => {
+                table.spatial_indexes.insert(idx, SpatialIndex::default());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn rebuild_secondary_indexes(table: &mut Table) {
+    for index in table.json_indexes.values_mut() {
+        index.map.clear();
+    }
+    for index in table.jsonb_indexes.values_mut() {
+        index.map.clear();
+    }
+    for index in table.xml_indexes.values_mut() {
+        index.map.clear();
+    }
+    for index in table.spatial_indexes.values_mut() {
+        index.tree = RTree::new();
+    }
+    for row_index in 0..table.rows.len() {
+        update_indexes_for_row(table, row_index);
+    }
+}
+
+fn update_indexes_for_row(table: &mut Table, row_index: usize) {
+    let row = &table.rows[row_index];
+    for (col_idx, index) in table.json_indexes.iter_mut() {
+        if let Some(Value::Json(value)) = row.get(*col_idx) {
+            let key = canonical_json(value);
+            index.map.entry(key).or_default().push(row_index);
+        }
+    }
+    for (col_idx, index) in table.jsonb_indexes.iter_mut() {
+        if let Some(Value::Jsonb(value)) = row.get(*col_idx) {
+            let key = canonical_json(value);
+            index.map.entry(key).or_default().push(row_index);
+        }
+    }
+    for (col_idx, index) in table.xml_indexes.iter_mut() {
+        if let Some(Value::Xml(xml)) = row.get(*col_idx) {
+            if let Some(root) = xml_root_name(xml) {
+                index.map.entry(root).or_default().push(row_index);
+            }
+        }
+    }
+    for (col_idx, index) in table.spatial_indexes.iter_mut() {
+        if let Some(Value::Geometry(geom)) = row.get(*col_idx) {
+            let bbox = geom.to_aabb();
+            index.tree.insert(SpatialIndexItem {
+                row: row_index,
+                bbox,
+            });
+        }
+    }
+}
+
+fn canonical_json(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Null => "null".to_string(),
+        JsonValue::Bool(b) => b.to_string(),
+        JsonValue::Number(num) => num.to_string(),
+        JsonValue::String(s) => serde_json::to_string(s).unwrap_or_default(),
+        JsonValue::Array(values) => {
+            let items: Vec<_> = values.iter().map(canonical_json).collect();
+            format!("[{}]", items.join(","))
+        }
+        JsonValue::Object(map) => {
+            let mut items: Vec<_> = map.iter().collect();
+            items.sort_by(|a, b| a.0.cmp(b.0));
+            let mut parts = Vec::with_capacity(items.len());
+            for (key, value) in items {
+                let key_serialized = serde_json::to_string(key).unwrap_or_default();
+                parts.push(format!("{key_serialized}:{}", canonical_json(value)));
+            }
+            format!("{{{}}}", parts.join(","))
+        }
+    }
+}
+
+fn normalize_json(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Array(values) => {
+            JsonValue::Array(values.into_iter().map(normalize_json).collect())
+        }
+        JsonValue::Object(map) => {
+            let mut items: Vec<_> = map.into_iter().collect();
+            items.sort_by(|a, b| a.0.cmp(&b.0));
+            let normalized = items
+                .into_iter()
+                .map(|(key, value)| (key, normalize_json(value)))
+                .collect();
+            JsonValue::Object(normalized)
+        }
+        other => other,
+    }
+}
+
+fn xml_root_name(xml: &str) -> Option<String> {
+    Document::parse(xml)
+        .ok()
+        .map(|doc| doc.root_element().tag_name().name().to_string())
+}
+
+fn value_into_json(value: Value) -> Result<JsonValue, SqlDatabaseError> {
+    match value {
+        Value::Json(v) | Value::Jsonb(v) => Ok(v),
+        Value::Text(text) => serde_json::from_str(&text)
+            .map_err(|_| SqlDatabaseError::SchemaMismatch("failed to parse string as JSON".into())),
+        Value::Null => Ok(JsonValue::Null),
+        other => Err(SqlDatabaseError::SchemaMismatch(format!(
+            "cannot interpret {other:?} as JSON"
+        ))),
+    }
+}
+
+fn value_into_xml(value: Value) -> Result<String, SqlDatabaseError> {
+    match value {
+        Value::Xml(xml) => {
+            Document::parse(&xml)
+                .map_err(|_| SqlDatabaseError::SchemaMismatch("invalid XML literal".into()))?;
+            Ok(xml)
+        }
+        Value::Text(text) => {
+            Document::parse(&text)
+                .map_err(|_| SqlDatabaseError::SchemaMismatch("invalid XML literal".into()))?;
+            Ok(text)
+        }
+        Value::Null => Ok(String::new()),
+        other => Err(SqlDatabaseError::SchemaMismatch(format!(
+            "cannot interpret {other:?} as XML"
+        ))),
+    }
+}
+
+fn value_into_geometry(value: Value) -> Result<Geometry, SqlDatabaseError> {
+    match value {
+        Value::Geometry(g) => Ok(g),
+        Value::Text(text) => parse_geometry_literal(&text)
+            .ok_or_else(|| SqlDatabaseError::SchemaMismatch("invalid geometry literal".into())),
+        Value::Json(json) | Value::Jsonb(json) => parse_geometry_from_json(&json)
+            .ok_or_else(|| SqlDatabaseError::SchemaMismatch("invalid geometry JSON".into())),
+        Value::Null => Err(SqlDatabaseError::SchemaMismatch(
+            "geometry literals cannot be NULL".into(),
+        )),
+        other => Err(SqlDatabaseError::SchemaMismatch(format!(
+            "cannot interpret {other:?} as geometry"
+        ))),
+    }
+}
+
+fn parse_geometry_literal(text: &str) -> Option<Geometry> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("POINT(") && trimmed.ends_with(')') {
+        let inner = &trimmed[6..trimmed.len() - 1];
+        let parts: Vec<_> = inner
+            .split(|c| c == ',' || c.is_whitespace())
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let x = parts[0].parse::<f64>().ok()?;
+        let y = parts[1].parse::<f64>().ok()?;
+        return Some(Geometry::Point { x, y });
+    }
+    if trimmed.starts_with('[') {
+        if let Ok(array) = serde_json::from_str::<Vec<f64>>(trimmed) {
+            if array.len() == 4 {
+                return Some(Geometry::BoundingBox {
+                    min_x: array[0],
+                    min_y: array[1],
+                    max_x: array[2],
+                    max_y: array[3],
+                });
+            }
+        }
+    }
+    None
+}
+
+fn parse_geometry_from_json(json: &JsonValue) -> Option<Geometry> {
+    match json {
+        JsonValue::Object(map) => {
+            let ty = map.get("type")?.as_str()?;
+            match ty.to_ascii_uppercase().as_str() {
+                "POINT" => {
+                    let coords = map.get("coordinates")?.as_array()?;
+                    if coords.len() == 2 {
+                        let x = coords[0].as_f64()?;
+                        let y = coords[1].as_f64()?;
+                        Some(Geometry::Point { x, y })
+                    } else {
+                        None
+                    }
+                }
+                "BBOX" => {
+                    let coords = map.get("coordinates")?.as_array()?;
+                    if coords.len() == 4 {
+                        let min_x = coords[0].as_f64()?;
+                        let min_y = coords[1].as_f64()?;
+                        let max_x = coords[2].as_f64()?;
+                        let max_y = coords[3].as_f64()?;
+                        Some(Geometry::BoundingBox {
+                            min_x,
+                            min_y,
+                            max_x,
+                            max_y,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        JsonValue::Array(values) if values.len() == 4 => Some(Geometry::BoundingBox {
+            min_x: values[0].as_f64()?,
+            min_y: values[1].as_f64()?,
+            max_x: values[2].as_f64()?,
+            max_y: values[3].as_f64()?,
+        }),
+        _ => None,
     }
 }
 
@@ -2063,6 +2515,22 @@ fn row_signature(row: &[Value]) -> String {
             Value::Timestamp(ts) => {
                 signature.push_str("ts:");
                 signature.push_str(&ts.to_rfc3339());
+            }
+            Value::Json(v) => {
+                signature.push_str("j:");
+                signature.push_str(&canonical_json(v));
+            }
+            Value::Jsonb(v) => {
+                signature.push_str("jb:");
+                signature.push_str(&canonical_json(v));
+            }
+            Value::Xml(s) => {
+                signature.push_str("x:");
+                signature.push_str(s);
+            }
+            Value::Geometry(g) => {
+                signature.push_str("g:");
+                signature.push_str(&geometry_to_string(g));
             }
             Value::Null => {
                 signature.push_str("n:");
@@ -2304,6 +2772,10 @@ fn parse_column_type(input: &str) -> Result<ColumnType, SqlDatabaseError> {
         "TEXT" | "STRING" | "VARCHAR" | "CHAR" => Ok(ColumnType::Text),
         "BOOL" | "BOOLEAN" => Ok(ColumnType::Boolean),
         "TIMESTAMP" | "DATETIME" => Ok(ColumnType::Timestamp),
+        "JSON" => Ok(ColumnType::Json),
+        "JSONB" => Ok(ColumnType::Jsonb),
+        "XML" => Ok(ColumnType::Xml),
+        "GEOMETRY" | "SPATIAL" => Ok(ColumnType::Geometry),
         other => Err(SqlDatabaseError::Parse(format!(
             "unsupported column type '{other}'"
         ))),
@@ -2333,6 +2805,19 @@ fn parse_value(token: &str) -> Result<Value, SqlDatabaseError> {
     }
     if let Ok(float) = trimmed.parse::<f64>() {
         return Ok(Value::Float(float));
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(json) = serde_json::from_str::<JsonValue>(trimmed) {
+            return Ok(Value::Json(json));
+        }
+    }
+    if trimmed.starts_with('<') {
+        if Document::parse(trimmed).is_ok() {
+            return Ok(Value::Xml(trimmed.to_string()));
+        }
+    }
+    if let Some(geometry) = parse_geometry_literal(trimmed) {
+        return Ok(Value::Geometry(geometry));
     }
     Err(SqlDatabaseError::Parse(format!(
         "unable to parse literal '{trimmed}'"
@@ -2543,6 +3028,10 @@ fn partition_key_string(value: &Value) -> String {
         Value::Text(s) => format!("T:{s}"),
         Value::Boolean(b) => format!("B:{b}"),
         Value::Timestamp(ts) => format!("TS:{}", ts.to_rfc3339()),
+        Value::Json(v) => format!("J:{}", canonical_json(v)),
+        Value::Jsonb(v) => format!("JB:{}", canonical_json(v)),
+        Value::Xml(s) => format!("X:{s}"),
+        Value::Geometry(g) => format!("G:{}", geometry_to_string(g)),
     }
 }
 
@@ -2641,6 +3130,66 @@ fn coerce_value(value: Value, target: ColumnType) -> Result<Value, SqlDatabaseEr
                 "cannot coerce BOOLEAN to TIMESTAMP".into(),
             )),
             Value::Null => Ok(Value::Null),
+            Value::Json(_) | Value::Jsonb(_) | Value::Xml(_) | Value::Geometry(_) => Err(
+                SqlDatabaseError::SchemaMismatch("cannot coerce complex types to TIMESTAMP".into()),
+            ),
+        },
+        ColumnType::Json => match value {
+            Value::Json(v) => Ok(Value::Json(v)),
+            Value::Jsonb(v) => Ok(Value::Json(v)),
+            Value::Text(s) => serde_json::from_str(&s).map(Value::Json).map_err(|_| {
+                SqlDatabaseError::SchemaMismatch("failed to parse string as JSON".into())
+            }),
+            Value::Null => Ok(Value::Null),
+            other => Err(SqlDatabaseError::SchemaMismatch(format!(
+                "cannot coerce {other:?} to JSON"
+            ))),
+        },
+        ColumnType::Jsonb => match value {
+            Value::Json(v) => Ok(Value::Jsonb(normalize_json(v))),
+            Value::Jsonb(v) => Ok(Value::Jsonb(normalize_json(v))),
+            Value::Text(s) => serde_json::from_str(&s)
+                .map(normalize_json)
+                .map(Value::Jsonb)
+                .map_err(|_| {
+                    SqlDatabaseError::SchemaMismatch("failed to parse string as JSONB".into())
+                }),
+            Value::Null => Ok(Value::Null),
+            other => Err(SqlDatabaseError::SchemaMismatch(format!(
+                "cannot coerce {other:?} to JSONB"
+            ))),
+        },
+        ColumnType::Xml => match value {
+            Value::Xml(xml) => {
+                Document::parse(&xml)
+                    .map_err(|_| SqlDatabaseError::SchemaMismatch("invalid XML literal".into()))?;
+                Ok(Value::Xml(xml))
+            }
+            Value::Text(s) => {
+                Document::parse(&s)
+                    .map_err(|_| SqlDatabaseError::SchemaMismatch("invalid XML literal".into()))?;
+                Ok(Value::Xml(s))
+            }
+            Value::Null => Ok(Value::Null),
+            other => Err(SqlDatabaseError::SchemaMismatch(format!(
+                "cannot coerce {other:?} to XML"
+            ))),
+        },
+        ColumnType::Geometry => match value {
+            Value::Geometry(g) => Ok(Value::Geometry(g)),
+            Value::Text(s) => parse_geometry_literal(&s)
+                .map(Value::Geometry)
+                .ok_or_else(|| SqlDatabaseError::SchemaMismatch("invalid geometry literal".into())),
+            Value::Json(json) => parse_geometry_from_json(&json)
+                .map(Value::Geometry)
+                .ok_or_else(|| SqlDatabaseError::SchemaMismatch("invalid geometry JSON".into())),
+            Value::Jsonb(json) => parse_geometry_from_json(&json)
+                .map(Value::Geometry)
+                .ok_or_else(|| SqlDatabaseError::SchemaMismatch("invalid geometry JSON".into())),
+            Value::Null => Ok(Value::Null),
+            other => Err(SqlDatabaseError::SchemaMismatch(format!(
+                "cannot coerce {other:?} to GEOMETRY"
+            ))),
         },
     }
 }
@@ -2701,6 +3250,24 @@ fn equal(left: &Value, right: &Value) -> bool {
         (Value::Float(a), Value::Timestamp(b)) => timestamp_from_float(*a)
             .map(|parsed| parsed == *b)
             .unwrap_or(false),
+        (Value::Json(a), Value::Json(b)) => canonical_json(a) == canonical_json(b),
+        (Value::Json(a), Value::Jsonb(b)) | (Value::Jsonb(b), Value::Json(a)) => {
+            canonical_json(a) == canonical_json(b)
+        }
+        (Value::Jsonb(a), Value::Jsonb(b)) => canonical_json(a) == canonical_json(b),
+        (Value::Json(a), Value::Text(b)) | (Value::Text(b), Value::Json(a)) => {
+            serde_json::from_str::<JsonValue>(b)
+                .map(|parsed| canonical_json(&parsed) == canonical_json(a))
+                .unwrap_or(false)
+        }
+        (Value::Jsonb(a), Value::Text(b)) | (Value::Text(b), Value::Jsonb(a)) => {
+            serde_json::from_str::<JsonValue>(b)
+                .map(|parsed| canonical_json(&parsed) == canonical_json(a))
+                .unwrap_or(false)
+        }
+        (Value::Xml(a), Value::Xml(b)) => a == b,
+        (Value::Xml(a), Value::Text(b)) | (Value::Text(b), Value::Xml(a)) => a == b,
+        (Value::Geometry(a), Value::Geometry(b)) => a == b,
         _ => false,
     }
 }
@@ -2725,7 +3292,22 @@ fn format_value(value: &Value) -> String {
         Value::Text(s) => format!("\"{s}\""),
         Value::Boolean(b) => b.to_string(),
         Value::Timestamp(ts) => ts.to_rfc3339(),
+        Value::Json(v) | Value::Jsonb(v) => serde_json::to_string(v).unwrap_or_default(),
+        Value::Xml(s) => s.clone(),
+        Value::Geometry(g) => geometry_to_string(g),
         Value::Null => "NULL".into(),
+    }
+}
+
+fn geometry_to_string(geometry: &Geometry) -> String {
+    match geometry {
+        Geometry::Point { x, y } => format!("POINT({x} {y})"),
+        Geometry::BoundingBox {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        } => format!("[{min_x}, {min_y}, {max_x}, {max_y}]"),
     }
 }
 
@@ -2784,6 +3366,85 @@ mod tests {
                     rows[0],
                     vec![Value::Integer(1), Value::Text("Alice".into())]
                 );
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_and_jsonb_support() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE docs (id INT, data JSON, meta JSONB);")
+            .unwrap();
+        db.execute("INSERT INTO docs VALUES (1, JSON '{\"k\":1}', JSONB '{\"sorted\":true}');")
+            .unwrap();
+        db.execute("INSERT INTO docs VALUES (2, '{\"k\":2}', JSONB '{\"sorted\":false}');")
+            .unwrap();
+
+        let result = db
+            .execute("SELECT id FROM docs WHERE data = JSON '{\"k\":1}';")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+
+        let result = db
+            .execute("SELECT id FROM docs WHERE meta = JSONB '{\"sorted\":true}';")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xml_support() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE xml_docs (id INT, body XML);")
+            .unwrap();
+        db.execute("INSERT INTO xml_docs VALUES (1, XML '<root><item/></root>');")
+            .unwrap();
+        db.execute("INSERT INTO xml_docs VALUES (2, '<alt></alt>');")
+            .unwrap();
+
+        let result = db
+            .execute("SELECT id FROM xml_docs WHERE body = XML '<root><item/></root>';")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+    }
+
+    #[test]
+    fn geometry_support_with_rtree() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE shapes (id INT, area GEOMETRY);")
+            .unwrap();
+        db.execute("INSERT INTO shapes VALUES (1, GEOMETRY 'POINT(1 2)');")
+            .unwrap();
+        db.execute("INSERT INTO shapes VALUES (2, GEOMETRY '[0, 0, 5, 5]');")
+            .unwrap();
+        db.execute("INSERT INTO shapes VALUES (3, POINT(1 2));")
+            .unwrap();
+
+        let result = db
+            .execute("SELECT id FROM shapes WHERE area = GEOMETRY 'POINT(1 2)';")
+            .unwrap();
+        match result {
+            QueryResult::Rows { mut rows, .. } => {
+                rows.sort_by_key(|row| match row[0] {
+                    Value::Integer(i) => i,
+                    _ => 0,
+                });
+                assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
             }
             other => panic!("unexpected result {other:?}"),
         }
