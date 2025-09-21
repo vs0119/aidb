@@ -6,15 +6,18 @@ use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
 mod execution;
+mod external;
 mod planner;
 
 use execution::TaskScheduler;
 
+pub use external::{ExternalCostFactors, ExternalSource, ParquetConnector};
 pub use planner::JoinPredicate;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -38,7 +41,7 @@ pub(crate) struct Column {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ColumnType {
+pub enum ColumnType {
     Integer,
     Float,
     Text,
@@ -296,6 +299,7 @@ pub struct HistogramBucket {
 pub struct SqlDatabase {
     tables: HashMap<String, Table>,
     system_tables: HashMap<String, Table>,
+    external_tables: HashMap<String, ExternalTableEntry>,
     materialized_views: HashMap<String, MaterializedView>,
     materialized_view_dependencies: HashMap<String, HashSet<String>>,
     pending_view_refreshes: VecDeque<MaterializedViewRefreshRequest>,
@@ -308,6 +312,19 @@ pub struct SqlDatabase {
     execution_config: ExecutionConfig,
     scheduler: Option<Arc<TaskScheduler>>,
     execution_stats: Arc<Mutex<ExecutionStats>>,
+}
+
+struct ExternalTableEntry {
+    schema: Table,
+    connector: Arc<dyn ExternalSource>,
+}
+
+impl fmt::Debug for ExternalTableEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalTableEntry")
+            .field("columns", &self.schema.columns.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -345,7 +362,9 @@ impl PlanCacheKey {
 
 #[derive(Debug, Clone)]
 struct CachedBatchSlice {
+    #[allow(dead_code)]
     start: usize,
+    #[allow(dead_code)]
     len: usize,
 }
 
@@ -489,7 +508,6 @@ struct MaterializedView {
     definition: SelectStatement,
     refresh_mode: MaterializedViewRefreshMode,
     table: Table,
-    dependencies: Vec<String>,
     last_refreshed_at: Option<DateTime<Utc>>,
     pending_async_refresh: bool,
 }
@@ -510,6 +528,7 @@ impl SqlDatabase {
         let mut db = Self {
             tables: HashMap::new(),
             system_tables: HashMap::new(),
+            external_tables: HashMap::new(),
             materialized_views: HashMap::new(),
             materialized_view_dependencies: HashMap::new(),
             pending_view_refreshes: VecDeque::new(),
@@ -525,6 +544,30 @@ impl SqlDatabase {
         };
         db.initialize_system_catalog();
         db
+    }
+
+    pub fn register_external_table(
+        &mut self,
+        name: &str,
+        connector: Arc<dyn ExternalSource>,
+    ) -> Result<(), SqlDatabaseError> {
+        if self.tables.contains_key(name)
+            || self.system_tables.contains_key(name)
+            || self.materialized_views.contains_key(name)
+            || self.external_tables.contains_key(name)
+        {
+            return Err(SqlDatabaseError::TableExists(name.to_string()));
+        }
+        let columns = connector
+            .schema()
+            .into_iter()
+            .map(|col| (col.name, col.ty))
+            .collect();
+        let schema = Table::with_columns(columns);
+        self.external_tables
+            .insert(name.to_string(), ExternalTableEntry { schema, connector });
+        self.invalidate_cache_for_table(name);
+        Ok(())
     }
 
     fn build_scheduler(parallelism: usize) -> Option<Arc<TaskScheduler>> {
@@ -829,6 +872,12 @@ impl SqlDatabase {
             .find(|view| view.definition == *select)
     }
 
+    fn lookup_relation<'a, V>(map: &'a HashMap<String, V>, name: &str) -> Option<(&'a str, &'a V)> {
+        map.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(key, value)| (key.as_str(), value))
+    }
+
     fn refresh_materialized_view_now(&mut self, name: &str) -> Result<(), SqlDatabaseError> {
         let mut view = self
             .materialized_views
@@ -1016,7 +1065,6 @@ impl SqlDatabase {
             definition: query,
             refresh_mode: refresh,
             table,
-            dependencies: dependencies.clone(),
             last_refreshed_at: Some(Utc::now()),
             pending_async_refresh: false,
         };
@@ -1221,9 +1269,11 @@ impl SqlDatabase {
                 cte_tables,
                 mode,
             )
-        } else if let Some(view) = self.materialized_views.get(&select.table) {
+        } else if let Some((view_name, view)) =
+            Self::lookup_relation(&self.materialized_views, &select.table)
+        {
             let resolved = planner::ResolvedTable::new(
-                view.name.as_str(),
+                view_name,
                 planner::TableSource::MaterializedView,
                 &view.table,
             );
@@ -1247,11 +1297,13 @@ impl SqlDatabase {
                 cte_tables,
                 mode,
             )
-        } else if let Some(table) = self.tables.get(&select.table) {
+        } else if let Some((table_name, entry)) =
+            Self::lookup_relation(&self.external_tables, &select.table)
+        {
             let resolved = planner::ResolvedTable::new(
-                select.table.as_str(),
-                planner::TableSource::Base,
-                table,
+                table_name,
+                planner::TableSource::External,
+                &entry.schema,
             );
             self.exec_select_from_table(
                 resolved,
@@ -1260,12 +1312,22 @@ impl SqlDatabase {
                 cte_tables,
                 mode,
             )
-        } else if let Some(table) = self.system_tables.get(&select.table) {
-            let resolved = planner::ResolvedTable::new(
-                select.table.as_str(),
-                planner::TableSource::System,
-                table,
-            );
+        } else if let Some((table_name, table)) = Self::lookup_relation(&self.tables, &select.table)
+        {
+            let resolved =
+                planner::ResolvedTable::new(table_name, planner::TableSource::Base, table);
+            self.exec_select_from_table(
+                resolved,
+                &select.columns,
+                select.predicate.as_ref(),
+                cte_tables,
+                mode,
+            )
+        } else if let Some((table_name, table)) =
+            Self::lookup_relation(&self.system_tables, &select.table)
+        {
+            let resolved =
+                planner::ResolvedTable::new(table_name, planner::TableSource::System, table);
             self.exec_select_from_table(
                 resolved,
                 &select.columns,
@@ -1288,7 +1350,19 @@ impl SqlDatabase {
     ) -> Result<QueryResult, SqlDatabaseError> {
         let table_stats = self.get_table_statistics(table_ref.name);
         let column_stats = self.column_statistics(table_ref.name);
-        let context = planner::PlanContext::new(table_ref, table_stats, column_stats);
+        let external = if matches!(table_ref.source, planner::TableSource::External) {
+            self.external_tables
+                .get(table_ref.name)
+                .map(|entry| entry.connector.as_ref())
+        } else {
+            None
+        };
+        let predicate = if matches!(table_ref.source, planner::TableSource::MaterializedView) {
+            None
+        } else {
+            predicate
+        };
+        let context = planner::PlanContext::new(table_ref, table_stats, column_stats, external);
         let mut builder = planner::LogicalPlanBuilder::scan(table_ref);
         if let Some(pred) = predicate.cloned() {
             builder = builder.filter(pred);
@@ -1401,6 +1475,9 @@ impl SqlDatabase {
         scan: &planner::ScanExpr,
         cte_tables: &HashMap<String, Table>,
     ) -> Result<(QueryResult, Vec<usize>), SqlDatabaseError> {
+        if matches!(scan.table.source, planner::TableSource::External) {
+            return self.execute_external_select(projection, predicate, scan, cte_tables);
+        }
         let table = scan.table.table;
         let iter: Box<dyn Iterator<Item = usize>> = match scan.candidates.as_slice() {
             Some(rows) => Box::new(rows.iter().copied()),
@@ -1496,6 +1573,80 @@ impl SqlDatabase {
         Ok((result, matching_indices))
     }
 
+    fn execute_external_select(
+        &self,
+        projection: &planner::ProjectionExpr,
+        predicate: Option<&Predicate>,
+        scan: &planner::ScanExpr,
+        cte_tables: &HashMap<String, Table>,
+    ) -> Result<(QueryResult, Vec<usize>), SqlDatabaseError> {
+        let entry = self
+            .external_tables
+            .get(scan.table.name)
+            .ok_or_else(|| SqlDatabaseError::UnknownTable(scan.table.name.to_string()))?;
+        let connector = entry.connector.as_ref();
+        let request = external::ExternalScanRequest {
+            predicate: scan.options.pushdown_predicate.as_ref(),
+        };
+        let result = connector.scan(request)?;
+        let total_rows = result.rows.len();
+        let mut filtered_rows = Vec::new();
+        let mut matching_indices = Vec::new();
+        for (idx, row) in result.rows.into_iter().enumerate() {
+            if let Some(pred) = predicate {
+                if !self.evaluate_predicate(&entry.schema, pred, &row, cte_tables)? {
+                    continue;
+                }
+            }
+            matching_indices.push(idx);
+            filtered_rows.push(row);
+        }
+
+        self.record_scan_stats(total_rows, filtered_rows.len(), 1, false);
+
+        let output = match &projection.columns {
+            SelectColumns::All => {
+                let columns = entry
+                    .schema
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                QueryResult::Rows {
+                    columns,
+                    rows: filtered_rows,
+                }
+            }
+            SelectColumns::Some(items) => {
+                let mut indices = Vec::with_capacity(items.len());
+                let mut columns = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        SelectItem::Column(name) => {
+                            let idx = self.column_index(&entry.schema, name)?;
+                            indices.push(idx);
+                            columns.push(entry.schema.columns[idx].name.clone());
+                        }
+                        SelectItem::WindowFunction(_) => {
+                            return Err(SqlDatabaseError::Unsupported);
+                        }
+                    }
+                }
+                let mut rows = Vec::with_capacity(filtered_rows.len());
+                for row in filtered_rows {
+                    let mut projected = Vec::with_capacity(indices.len());
+                    for idx in &indices {
+                        projected.push(row[*idx].clone());
+                    }
+                    rows.push(projected);
+                }
+                QueryResult::Rows { columns, rows }
+            }
+        };
+
+        Ok((output, matching_indices))
+    }
+
     fn try_vectorized_select(
         &self,
         projection: &planner::ProjectionExpr,
@@ -1503,11 +1654,14 @@ impl SqlDatabase {
         scan: &planner::ScanExpr,
         cte_tables: &HashMap<String, Table>,
     ) -> Result<Option<VectorizedSelectResult>, SqlDatabaseError> {
+        if matches!(scan.table.source, planner::TableSource::External) {
+            return Ok(None);
+        }
         use execution::{
             apply_predicate, build_batch_for_partition, collect_rows, partition_scan_candidates,
         };
 
-        #[derive(Default)]
+        #[derive(Default, Clone)]
         struct PartitionOutcome {
             rows: Vec<Vec<Value>>,
             input_rows: usize,
@@ -1552,9 +1706,12 @@ impl SqlDatabase {
 
         if partitions.is_empty() {
             self.record_scan_stats(0, 0, 0, false);
-            return Ok(Some(QueryResult::Rows {
-                columns: output_columns,
-                rows: Vec::new(),
+            return Ok(Some(VectorizedSelectResult {
+                result: QueryResult::Rows {
+                    columns: output_columns,
+                    rows: Vec::new(),
+                },
+                batch_slices: Vec::new(),
             }));
         }
 
@@ -1702,6 +1859,15 @@ impl SqlDatabase {
                     value: coerced,
                 })
             }
+            Predicate::GreaterOrEqual { column, value } => {
+                let idx = self.column_index(table, column)?;
+                let column_type = table.columns[idx].ty;
+                let coerced = coerce_static_value(value, column_type)?;
+                Ok(BatchPredicate::GreaterOrEqual {
+                    column_index: idx,
+                    value: coerced,
+                })
+            }
             Predicate::Between { column, start, end } => {
                 use std::cmp::Ordering;
                 let idx = self.column_index(table, column)?;
@@ -1728,11 +1894,35 @@ impl SqlDatabase {
                 table_column,
             } => {
                 let idx = self.column_index(table, column)?;
+                if let Some((_, entry)) = Self::lookup_relation(&self.external_tables, other_table)
+                {
+                    let other_idx = entry
+                        .schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(table_column))
+                        .ok_or_else(|| SqlDatabaseError::UnknownColumn(table_column.clone()))?;
+                    let scan = entry
+                        .connector
+                        .scan(external::ExternalScanRequest { predicate: None })?;
+                    let lookup_values = scan
+                        .rows
+                        .into_iter()
+                        .map(|row| row[other_idx].clone())
+                        .collect();
+                    return Ok(BatchPredicate::InTableColumn {
+                        column_index: idx,
+                        lookup_values,
+                    });
+                }
+
                 let lookup_table = if let Some(cte_table) = cte_tables.get(other_table) {
                     cte_table
-                } else if let Some(base) = self.tables.get(other_table) {
+                } else if let Some((_, base)) = Self::lookup_relation(&self.tables, other_table) {
                     base
-                } else if let Some(system) = self.system_tables.get(other_table) {
+                } else if let Some((_, system)) =
+                    Self::lookup_relation(&self.system_tables, other_table)
+                {
                     system
                 } else {
                     return Err(SqlDatabaseError::UnknownTable(other_table.clone()));
@@ -1922,6 +2112,7 @@ impl SqlDatabase {
             }
             planner::LogicalExpr::Scan(scan) => match scan.table.source {
                 planner::TableSource::Cte => None,
+                planner::TableSource::External => None,
                 planner::TableSource::Base
                 | planner::TableSource::System
                 | planner::TableSource::MaterializedView => {
@@ -1929,6 +2120,7 @@ impl SqlDatabase {
                         planner::TableSource::Base => "base",
                         planner::TableSource::System => "system",
                         planner::TableSource::MaterializedView => "materialized",
+                        planner::TableSource::External => unreachable!(),
                         planner::TableSource::Cte => unreachable!(),
                     };
                     let mut shape = format!("scan:{source}:{}", scan.table.name);
@@ -1998,6 +2190,10 @@ impl SqlDatabase {
             Predicate::Equals { column, value } => {
                 params.push(value_fingerprint(value));
                 Some((format!("eq:{}", column.to_ascii_lowercase()), Vec::new()))
+            }
+            Predicate::GreaterOrEqual { column, value } => {
+                params.push(value_fingerprint(value));
+                Some((format!("ge:{}", column.to_ascii_lowercase()), Vec::new()))
             }
             Predicate::Between { column, start, end } => {
                 let mut start_key = value_fingerprint(start);
@@ -2320,6 +2516,18 @@ impl SqlDatabase {
                 let coerced = coerce_static_value(value, column_type)?;
                 Ok(equal(&row[idx], &coerced))
             }
+            Predicate::GreaterOrEqual { column, value } => {
+                let idx = self.column_index(table, column)?;
+                if matches!(row[idx], Value::Null) {
+                    return Ok(false);
+                }
+                let column_type = table.columns[idx].ty;
+                let coerced = coerce_static_value(value, column_type)?;
+                Ok(matches!(
+                    compare_values(&row[idx], &coerced),
+                    Some(Ordering::Greater) | Some(Ordering::Equal)
+                ))
+            }
             Predicate::Between { column, start, end } => {
                 let idx = self.column_index(table, column)?;
                 if matches!(row[idx], Value::Null) {
@@ -2355,10 +2563,25 @@ impl SqlDatabase {
                 let value = &row[idx];
                 let lookup_table = if let Some(cte_table) = cte_tables.get(other_table) {
                     cte_table
-                } else if let Some(table) = self.tables.get(other_table) {
+                } else if let Some((_, table)) = Self::lookup_relation(&self.tables, other_table) {
                     table
-                } else if let Some(table) = self.system_tables.get(other_table) {
+                } else if let Some((_, table)) =
+                    Self::lookup_relation(&self.system_tables, other_table)
+                {
                     table
+                } else if let Some((_, entry)) =
+                    Self::lookup_relation(&self.external_tables, other_table)
+                {
+                    let scan = entry
+                        .connector
+                        .scan(external::ExternalScanRequest { predicate: None })?;
+                    let other_idx = entry
+                        .schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(table_column))
+                        .ok_or_else(|| SqlDatabaseError::UnknownColumn(table_column.clone()))?;
+                    return Ok(scan.rows.iter().any(|r| equal(&r[other_idx], value)));
                 } else {
                     return Err(SqlDatabaseError::UnknownTable(other_table.clone()));
                 };
@@ -2650,8 +2873,12 @@ impl WindowFunctionType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Predicate {
+pub enum Predicate {
     Equals {
+        column: String,
+        value: Value,
+    },
+    GreaterOrEqual {
         column: String,
         value: Value,
     },
@@ -2679,6 +2906,7 @@ impl Predicate {
     fn column_name(&self) -> &str {
         match self {
             Predicate::Equals { column, .. } => column,
+            Predicate::GreaterOrEqual { column, .. } => column,
             Predicate::Between { column, .. } => column,
             Predicate::IsNull { column } => column,
             Predicate::InTableColumn { column, .. } => column,
@@ -3381,14 +3609,19 @@ fn parse_select_statement(input: &str) -> Result<SelectStatement, SqlDatabaseErr
             })
         } else {
             rest = rest.trim_start();
-            if !rest.starts_with('=') {
+            if let Some(after_ge) = rest.strip_prefix(">=") {
+                let (value, rest_after_value) = parse_literal_token(after_ge)?;
+                ensure_no_trailing_tokens(rest_after_value)?;
+                Some(Predicate::GreaterOrEqual { column, value })
+            } else if !rest.starts_with('=') {
                 return Err(SqlDatabaseError::Parse(
                     "expected '=' in WHERE clause".into(),
                 ));
+            } else {
+                let (value, rest_after_value) = parse_literal_token(&rest[1..])?;
+                ensure_no_trailing_tokens(rest_after_value)?;
+                Some(Predicate::Equals { column, value })
             }
-            let (value, rest_after_value) = parse_literal_token(&rest[1..])?;
-            ensure_no_trailing_tokens(rest_after_value)?;
-            Some(Predicate::Equals { column, value })
         }
     };
     Ok(SelectStatement {
@@ -5153,8 +5386,8 @@ mod tests {
             .unwrap();
         match result {
             QueryResult::Rows { mut rows, .. } => {
-                rows.sort_by_key(|row| match row[0] {
-                    Value::Integer(i) => i,
+                rows.sort_by_key(|row| match &row[0] {
+                    Value::Integer(i) => *i,
                     _ => 0,
                 });
                 assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
@@ -5515,8 +5748,8 @@ mod tests {
                 assert_eq!(rows.len(), 2);
                 let mut ids = rows
                     .into_iter()
-                    .map(|row| match row[0] {
-                        Value::Integer(id) => id,
+                    .map(|row| match row.get(0) {
+                        Some(Value::Integer(id)) => *id,
                         _ => panic!("unexpected id"),
                     })
                     .collect::<Vec<_>>();
@@ -5574,8 +5807,8 @@ mod tests {
             .unwrap();
         let mut ids: Vec<i64> = row_values(&result)
             .iter()
-            .map(|row| match row[0] {
-                Value::Integer(id) => id,
+            .map(|row| match row.get(0) {
+                Some(Value::Integer(id)) => *id,
                 other => panic!("unexpected value {other:?}"),
             })
             .collect();
@@ -5585,8 +5818,8 @@ mod tests {
         let direct = db.execute("SELECT id FROM active_users;").unwrap();
         let mut direct_ids: Vec<i64> = row_values(&direct)
             .iter()
-            .map(|row| match row[0] {
-                Value::Integer(id) => id,
+            .map(|row| match row.get(0) {
+                Some(Value::Integer(id)) => *id,
                 other => panic!("unexpected value {other:?}"),
             })
             .collect();
@@ -5613,8 +5846,8 @@ mod tests {
             .unwrap();
         let ids: Vec<i64> = row_values(&initial)
             .iter()
-            .map(|row| match row[0] {
-                Value::Integer(id) => id,
+            .map(|row| match row.get(0) {
+                Some(Value::Integer(id)) => *id,
                 other => panic!("unexpected value {other:?}"),
             })
             .collect();
@@ -5627,8 +5860,8 @@ mod tests {
             .unwrap();
         let mut refreshed_ids: Vec<i64> = row_values(&refreshed)
             .iter()
-            .map(|row| match row[0] {
-                Value::Integer(id) => id,
+            .map(|row| match row.get(0) {
+                Some(Value::Integer(id)) => *id,
                 other => panic!("unexpected value {other:?}"),
             })
             .collect();
@@ -5884,7 +6117,7 @@ mod tests {
         let resolved = ResolvedTable::new(table_name, TableSource::Base, table);
         let table_stats = db.get_table_statistics(table_name);
         let column_stats = db.column_statistics(table_name);
-        let context = PlanContext::new(resolved, table_stats, column_stats);
+        let context = PlanContext::new(resolved, table_stats, column_stats, None);
         let mut builder = LogicalPlanBuilder::scan(resolved);
         if let Some(pred) = predicate {
             builder = builder.filter(pred);
@@ -5903,7 +6136,7 @@ mod tests {
         let resolved = ResolvedTable::new(table_name, TableSource::Base, table);
         let table_stats = db.get_table_statistics(table_name);
         let column_stats = db.column_statistics(table_name);
-        PlanContext::new(resolved, table_stats, column_stats)
+        PlanContext::new(resolved, table_stats, column_stats, None)
     }
 
     fn actual_join_cardinality(

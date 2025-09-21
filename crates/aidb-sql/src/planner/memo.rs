@@ -1,7 +1,7 @@
 use crate::{Predicate, SelectColumns};
 
 use super::logical::{
-    FilterExpr, LogicalExpr, LogicalPlan, ProjectionExpr, ScanCandidates, ScanExpr,
+    FilterExpr, LogicalExpr, LogicalPlan, ProjectionExpr, ScanCandidates, ScanExpr, ScanOptions,
 };
 use super::table_ref::ResolvedTable;
 
@@ -24,6 +24,7 @@ pub enum MemoExpr<'a> {
     Scan {
         table: ResolvedTable<'a>,
         candidates: ScanCandidates,
+        options: ScanOptions,
     },
 }
 
@@ -72,6 +73,7 @@ impl<'a> Memo<'a> {
             LogicalExpr::Scan(scan) => self.insert_operator(MemoExpr::Scan {
                 table: scan.table,
                 candidates: scan.candidates,
+                options: scan.options,
             }),
         }
     }
@@ -129,9 +131,14 @@ impl<'a> Memo<'a> {
                     input: Box::new(input_expr),
                 })
             }
-            MemoExpr::Scan { table, candidates } => LogicalExpr::Scan(ScanExpr {
+            MemoExpr::Scan {
+                table,
+                candidates,
+                options,
+            } => LogicalExpr::Scan(ScanExpr {
                 table: *table,
                 candidates: candidates.clone(),
+                options: options.clone(),
             }),
         }
     }

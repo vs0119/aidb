@@ -1,7 +1,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 use std::collections::HashMap;
 
-use crate::{ColumnStatistics, Table, TableStatistics, Value};
+use crate::{ColumnStatistics, ExternalSource, Table, TableStatistics, Value};
 
 use super::table_ref::ResolvedTable;
 
@@ -56,6 +56,7 @@ impl PlanStatistics {
 pub struct PlanContext<'a> {
     pub table: ResolvedTable<'a>,
     stats: PlanStatistics,
+    external: Option<&'a dyn ExternalSource>,
 }
 
 impl<'a> PlanContext<'a> {
@@ -63,6 +64,7 @@ impl<'a> PlanContext<'a> {
         table: ResolvedTable<'a>,
         table_stats: Option<TableStatistics>,
         column_stats: Vec<ColumnStatistics>,
+        external: Option<&'a dyn ExternalSource>,
     ) -> Self {
         let average_row_width = approximate_row_width(table.table);
         let stats = PlanStatistics::new(
@@ -71,11 +73,19 @@ impl<'a> PlanContext<'a> {
             table_stats,
             column_stats,
         );
-        Self { table, stats }
+        Self {
+            table,
+            stats,
+            external,
+        }
     }
 
     pub fn statistics(&self) -> &PlanStatistics {
         &self.stats
+    }
+
+    pub fn external(&self) -> Option<&'a dyn ExternalSource> {
+        self.external
     }
 }
 
