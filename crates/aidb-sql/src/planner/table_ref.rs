@@ -7,6 +7,7 @@ pub enum TableSource {
     Base,
     System,
     Cte,
+    MaterializedView,
 }
 
 #[derive(Clone, Copy)]
