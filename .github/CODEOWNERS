@@ -1,0 +1,16 @@
+# Default owners
+*       @aidb-dev/maintainers
+
+# Storage engine changes
+crates/aidb-storage/**          @aidb-dev/storage
+crates/aidb-storage-engine/**   @aidb-dev/storage
+
+# Indexing layers
+crates/aidb-index-*/**          @aidb-dev/indexing
+
+# Server / API
+crates/aidb-server/**           @aidb-dev/backend
+apps/**                         @aidb-dev/backend
+
+# SQL engine
+crates/aidb-sql/**              @aidb-dev/sql

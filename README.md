@@ -1,143 +1,100 @@
 # AIDB — AI-Optimized Vector Database (Rust)
 
-AIDB is an experimental, high-performance database engine tailored for AI workloads:
-- Vector similarity search (cosine, L2) with metadata filtering
-- Durable writes via WAL; fast in-memory read path
-- Modular index trait with a pluggable ANN layer (starts with brute-force; HNSW/IVF planned)
-- Minimal HTTP server for CRUD + search
+AIDB is an experimental, high-performance vector database for AI workloads. It
+combines fast approximate nearest-neighbor search, durable storage, and a simple
+Rust API/HTTP surface so you can prototype retrieval-augmented systems without
+wrestling with infrastructure.
 
-This repository is a scaffold that runs locally and establishes clean boundaries for storage, indexing, and serving. It’s designed to evolve into an extreme-performance engine by swapping the index and storage backends without rewriting the API surface.
+## Project Status
 
-## Quick Overview
+> **Alpha** – the architecture is stabilizing, but APIs may change. Follow the
+> roadmap below to see what is coming next.
 
-- `crates/aidb-core`: Core types, metrics, index trait
-- `crates/aidb-index-bf`: Brute-force index with parallel scoring
-- `crates/aidb-storage`: WAL, in-memory collection, simple engine
-- `crates/aidb-server`: Axum HTTP server exposing collection + search APIs
-- `crates/aidb-sql`: Lightweight in-memory SQL database for quick relational prototyping
+## Features
 
-## Building & Running
+- Vector similarity search (cosine, L2) with optional metadata filters
+- Durable writes with a write-ahead log and in-memory query path
+- Modular indexing layer (brute-force today, adaptive/HNSW indexes in progress)
+- Axum-based HTTP server for CRUD and search
+- Embedded SQL surface for metadata prototyping
 
-Rust 1.70+ recommended. The first build fetches dependencies from crates.io.
+## Quick Start
 
-```
-# from repo root
+```bash
+# Install the Rust toolchain (1.70+) if you have not already.
+curl https://sh.rustup.rs -sSf | sh
+
+# Clone and build
+git clone https://github.com/aidb-dev/aidb.git
+cd aidb
 cargo run -p aidb-server
-# server listens on 0.0.0.0:8080
 ```
 
-### Benchmarks
+The server listens on `0.0.0.0:8080` by default. You can exercise the API with
+`curl` or the examples in [`docs/http-api.md`](docs/http-api.md).
 
-- In‑process index benchmark (no HTTP):
-```
-cargo run -p aidb-bench --release -- --mode=index --index=hnsw --dim=768 --n=200000 --q=500 --topk=10 --m=16 --efc=200 --efs=64
-```
+### Examples
 
-- HTTP end‑to‑end benchmark (server must be running):
-```
-cargo run -p aidb-bench --release -- --mode=http --base=http://127.0.0.1:8080 --col=bench --index=hnsw --dim=768 --n=200000 --q=500 --topk=10 --m=16 --efc=200 --efs=64 --batch=1000
+```bash
+# Run the crate-level example that adds and queries vectors
+cargo run --package aidb-core --example basic
 ```
 
-- Reporting:
-```
-# JSON to stdout
-cargo run -p aidb-bench --release -- --mode=index --report=json
+### Testing & Benchmarks
 
-# CSV to file
-cargo run -p aidb-bench --release -- --mode=http --report=csv --out=bench.csv
-```
-
-## API
-
-- `POST /collections` – create a collection
-```json
-{ "name": "docs", "dim": 768, "metric": "cosine", "wal_dir": "./data" }
+```bash
+cargo fmt -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo bench --workspace --no-run
 ```
 
-- `POST /collections/:name/points` – upsert a vector
-```json
-{ "vector": [0.12, 0.98, ...], "payload": {"source": "a.txt"} }
-```
+These commands are enforced in CI on pull requests and pushes to `main`.
 
-- `POST /collections/:name/search` – vector search
-```json
-{ "vector": [0.1, 0.2, ...], "top_k": 10, "filter": {"source": "a.txt"} }
-```
-- `POST /collections/:name/search:batch` – batch vector search (single `top_k`/filter shared)
-```json
-{
-  "queries": [[0.1, 0.2, ...], [0.9, 0.1, ...]],
-  "top_k": 10,
-  "filter": {"source": "a.txt"}
-}
-```
-- `DELETE /collections/:name/points/:id` – delete a point
+## Documentation
 
-- `POST /sql` – execute SQL-style commands directly against AIDB (see
-  [`docs/sql.md`](docs/sql.md) for full syntax)
-  - `CREATE COLLECTION docs (DIM = 768, METRIC = 'cosine', INDEX = 'hnsw');`
-  - `INSERT INTO docs VALUES (ID = '...', VECTOR = [0.1, 0.2, ...], PAYLOAD = {"source": "a.txt"});`
-  - `SEARCH docs (VECTOR = [0.1, 0.2, ...], TOPK = 5, FILTER = {"source": "a.txt"});`
+- [Core crate docs](crates/aidb-core/src/lib.rs)
+- [HTTP API](docs/http-api.md)
+- [SQL engine](docs/sql.md)
+- [Bench harness](apps/README.md)
+- [Contributing](CONTRIBUTING.md)
 
-## Embedded SQL Database
+Generated documentation is available locally via `cargo doc --open`.
 
-`aidb-sql` offers a self-contained SQL execution engine that complements the
-vector APIs for quick prototyping. It currently supports:
+## Release Process
 
-- `CREATE TABLE` with `INT`, `FLOAT`, `TEXT`, and `BOOLEAN` columns.
-- `INSERT` statements (with optional column lists) and multi-row values.
-- `SELECT` queries with column projections, `SELECT *`, and simple `WHERE`
-  equality predicates.
+We follow [Semantic Versioning](https://semver.org/). Release tags take the form
+`vMAJOR.MINOR.PATCH`. The release workflow:
 
-Example:
+1. Update [`CHANGELOG.md`](CHANGELOG.md) with highlights for the version.
+2. Ensure `main` is green (fmt, clippy, test, benchmarks).
+3. Tag the commit (`git tag vX.Y.Z && git push origin vX.Y.Z`).
+4. Let the "Release" GitHub Actions workflow build artifacts and publish notes.
 
-```rust
-use aidb_sql::{QueryResult, SqlDatabase, Value};
+## Roadmap
 
-let mut db = SqlDatabase::new();
-db.execute("CREATE TABLE users (id INT, name TEXT, active BOOLEAN);")?;
-db.execute("INSERT INTO users VALUES (1, 'Ada', true), (2, 'Grace', false);")?;
-match db.execute("SELECT name FROM users WHERE active = true;")? {
-    QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Text("Ada".into())),
-    _ => unreachable!(),
-}
-```
+| Quarter | Focus | Highlights |
+| ------- | ----- | ---------- |
+| 2024 Q2 | Core fidelity | SIMD kernels, correctness checks, WAL durability |
+| 2024 Q3 | Indexing | HNSW graph search, IVF-Flat, quantization experiments |
+| 2024 Q4 | Serving | Horizontal sharding, observability, SQL planner |
+| 2025 Q1 | Ecosystem | Client SDKs, dashboard, managed hosting preview |
 
-See the crate's unit tests for additional examples.
+We track issues with the `roadmap` label; contributions welcome!
 
-## Performance Roadmap
+## Community & Governance
 
-This scaffold favors correctness and composability. To reach extreme performance:
-
-- Indexing
-  - HNSW with visited-set pruning, heuristics, multi-layer graph
-  - IVF-Flat, IVF-PQ with training/residuals; OPQ for rotation
-  - Scalar quantization + Product quantization; mixed-precision scoring
-  - Batched, SIMD-accelerated distance kernels; memory alignment
-  - Hybrid search (BM25 + vector) via inverted lists + re-rank
-
-- Storage
-  - Memory-mapped segments; zero-copy vector slices
-  - LSM-tree with compaction filters and tombstone GC
-  - Background index builds and atomic index swaps
-  - Snapshots + incremental checkpoints; CRC + fencing tokens
-
-- Serving
-  - Sharding + replication (Raft/Quorum); consistent hashing
-  - Columnar metadata store with predicate pushdown
-  - Streaming ingestion; backpressure and rate limiting
-  - Observability: request tracing, metrics, p99 SLAs
-
-- Hardware Acceleration
-  - GPU ANN (cuVS/RAFT), CPU AVX512/NEON kernels
-  - NUMA-aware scheduling; core pinning; cache locality
-
-## Notes
-
-- The brute-force index is parallelized (Rayon) and good for small/mid datasets and testing; replace with ANN for large scale.
-- WAL provides durability; recovery replays ops into the index.
-- Filters support exact-match key/value pairs for now.
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Contributing Guide](CONTRIBUTING.md)
+- Issue templates auto-label bug triage (`bug`, `enhancement`, `good first issue`)
+- CODEOWNERS ensure domain experts review changes to critical components
 
 ## License
 
-Proprietary scaffolding for local development unless you choose otherwise.
+AIDB is distributed under the terms of the [MIT License](LICENSE).
+
+## Acknowledgements
+
+This project stands on the shoulders of the Rust community and the fantastic
+vector search research ecosystem. Thank you for testing, profiling, and sharing
+feedback!

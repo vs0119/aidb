@@ -14,3 +14,7 @@ rayon.workspace = true
 rand.workspace = true
 wide.workspace = true
 
+[[bench]]
+name = "distance"
+harness = false
+
