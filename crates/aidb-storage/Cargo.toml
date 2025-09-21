@@ -13,6 +13,9 @@ thiserror.workspace = true
 uuid.workspace = true
 memmap2.workspace = true
 log.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 aidb-index-bf = { path = "../aidb-index-bf" }
+tempfile.workspace = true

@@ -7,9 +7,22 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{sync::Arc, thread};
 
 use aidb_core::{Id, JsonValue, MetadataFilter, Metric, SearchResult, Vector, VectorIndex};
+
+pub mod stats;
+pub mod stats_refresh;
 use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+pub use stats::{
+    ColumnStats, EquiDepthHistogramBuilder, EquiWidthHistogramBuilder, FileStatisticsCatalog,
+    Histogram, HistogramBucket, HistogramBuildError, HistogramBuilderStrategy,
+    HistogramMaintenanceResult, HistogramRef, HistogramType, InMemoryStatisticsCatalog,
+    StatisticsCatalog, StatisticsError, StatsValue, TableStats,
+};
+pub use stats_refresh::{
+    HistogramRefreshConfig, HistogramRefreshJob, HistogramSampleSource, ScheduledTaskHandle,
+    StatsRefreshError, StatsRefreshJob, StatsRefreshResult, StatsRefreshScheduler,
+};
 
 const WAL_LOG_INCREMENT_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB increments for logging
 
