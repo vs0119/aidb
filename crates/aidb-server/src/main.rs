@@ -8,7 +8,7 @@ use aidb_index_bf::BruteForceIndex;
 use aidb_index_hnsw::{HnswIndex, HnswParams};
 use aidb_sql::{QueryResult as SqlQueryResult, SqlDatabase, Value as SqlValue};
 use aidb_storage::{
-    Collection, Engine, InMemoryStatisticsCatalog, StatisticsCatalog, StatsRefreshScheduler
+    Collection, Engine, InMemoryStatisticsCatalog, StatisticsCatalog, StatsRefreshScheduler,
 };
 use axum::{
     extract::Path,
@@ -719,12 +719,15 @@ async fn get_table_statistics(
     let sql_db = state.sql_db.lock().unwrap();
     let stats = sql_db.table_statistics();
 
-    let result = stats.into_iter().map(|stat| TableStatistics {
-        table_name: stat.table_name,
-        row_count: stat.row_count,
-        analyzed_at: stat.analyzed_at.to_rfc3339(),
-        stats_version: stat.stats_version,
-    }).collect();
+    let result = stats
+        .into_iter()
+        .map(|stat| TableStatistics {
+            table_name: stat.table_name,
+            row_count: stat.row_count,
+            analyzed_at: stat.analyzed_at.to_rfc3339(),
+            stats_version: stat.stats_version,
+        })
+        .collect();
 
     Ok(Json(result))
 }
@@ -735,16 +738,19 @@ async fn get_column_statistics(
     let sql_db = state.sql_db.lock().unwrap();
     let stats = sql_db.all_column_statistics();
 
-    let result = stats.into_iter().map(|stat| ColumnStatistics {
-        table_name: stat.table_name,
-        column_name: stat.column_name,
-        null_count: Some(stat.null_count),
-        distinct_count: Some(stat.distinct_count),
-        min: stat.min.map(|v| format!("{:?}", v)),
-        max: stat.max.map(|v| format!("{:?}", v)),
-        analyzed_at: stat.analyzed_at.to_rfc3339(),
-        stats_version: stat.stats_version,
-    }).collect();
+    let result = stats
+        .into_iter()
+        .map(|stat| ColumnStatistics {
+            table_name: stat.table_name,
+            column_name: stat.column_name,
+            null_count: Some(stat.null_count),
+            distinct_count: Some(stat.distinct_count),
+            min: stat.min.map(|v| format!("{:?}", v)),
+            max: stat.max.map(|v| format!("{:?}", v)),
+            analyzed_at: stat.analyzed_at.to_rfc3339(),
+            stats_version: stat.stats_version,
+        })
+        .collect();
 
     Ok(Json(result))
 }

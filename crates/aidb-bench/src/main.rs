@@ -6,6 +6,7 @@ use std::time::Instant;
 use aidb_core::{Metric, VectorIndex};
 
 mod advanced_bench;
+mod jit_bench;
 use aidb_index_bf::BruteForceIndex;
 use aidb_index_hnsw::{HnswIndex, HnswParams};
 use rand::rngs::StdRng;
@@ -171,6 +172,38 @@ async fn main() {
     let mode = parse_str("mode", "index");
     let report_fmt = parse_str("report", ""); // "json" | "csv" | ""
     let out_path = parse_str("out", ""); // file path or empty for stdout
+
+    if mode == "sqljit" {
+        let rows = parse_arg("rows", 50_000usize);
+        let iterations = parse_arg("iters", 100usize);
+        let report = jit_bench::run_sql_jit_benchmark(rows, iterations);
+        if report_fmt == "json" {
+            let s = serde_json::to_string_pretty(&report).unwrap();
+            if out_path.is_empty() {
+                println!("{}", s);
+            } else {
+                let mut f = File::create(&out_path).expect("create report file");
+                f.write_all(s.as_bytes()).expect("write report");
+            }
+        } else {
+            let line = format!(
+                "SQL JIT benchmark: rows={} iterations={} warmup={} baseline_ms={:.3} jit_ms={:.3} speedup={:.2}x",
+                report.rows,
+                report.iterations,
+                report.warmup_iterations,
+                report.baseline_ms,
+                report.jit_ms,
+                report.speedup
+            );
+            if out_path.is_empty() {
+                println!("{}", line);
+            } else {
+                let mut f = File::create(&out_path).expect("create report file");
+                f.write_all(line.as_bytes()).expect("write report");
+            }
+        }
+        return;
+    }
 
     let report = if mode == "advanced" {
         // Run advanced benchmarks

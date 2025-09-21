@@ -3,12 +3,13 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use roxmltree::Document;
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde_json::Value as JsonValue;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use thiserror::Error;
 
+mod jit;
 mod planner;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -271,6 +272,9 @@ pub struct SqlDatabase {
     plan_cache: RefCell<HashMap<PlanCacheKey, CachedSelectResult>>,
     plan_cache_index: RefCell<HashMap<String, HashSet<PlanCacheKey>>>,
     plan_cache_stats: RefCell<CacheStats>,
+    jit_manager: RefCell<jit::JitManager>,
+    loop_profiler: RefCell<jit::LoopProfiler>,
+    jit_enabled: Cell<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -280,7 +284,7 @@ pub struct CacheStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PlanCacheKey {
+pub(crate) struct PlanCacheKey {
     shape: String,
     params: Vec<String>,
 }
@@ -347,9 +351,20 @@ impl SqlDatabase {
             plan_cache: RefCell::new(HashMap::new()),
             plan_cache_index: RefCell::new(HashMap::new()),
             plan_cache_stats: RefCell::new(CacheStats::default()),
+            jit_manager: RefCell::new(jit::JitManager::new()),
+            loop_profiler: RefCell::new(jit::LoopProfiler::new()),
+            jit_enabled: Cell::new(true),
         };
         db.initialize_system_catalog();
         db
+    }
+
+    pub fn set_jit_enabled(&mut self, enabled: bool) {
+        self.jit_enabled.set(enabled);
+    }
+
+    pub fn jit_enabled(&self) -> bool {
+        self.jit_enabled.get()
     }
 
     fn initialize_system_catalog(&mut self) {
@@ -815,89 +830,148 @@ impl SqlDatabase {
             None => Box::new(0..table.rows.len()),
         };
 
-        let mut matching_indices = Vec::new();
-        for row_index in iter {
-            let row = &table.rows[row_index];
-            if let Some(predicate) = predicate {
-                if !self.evaluate_predicate(table, predicate, row, cte_tables)? {
-                    continue;
+        let candidate_indices: Vec<usize> = iter.collect();
+        let plan_key = cache_metadata.as_ref().map(|m| m.key.clone());
+        let mut profiler_triggered = false;
+        if self.jit_enabled.get() {
+            if let Some(key) = plan_key.as_ref() {
+                let candidate_len = candidate_indices.len();
+                if candidate_len > 0 {
+                    profiler_triggered = {
+                        let mut profiler = self.loop_profiler.borrow_mut();
+                        profiler.observe(key, candidate_len)
+                    };
                 }
             }
-            matching_indices.push(row_index);
         }
+
+        let filter_kernel = if self.jit_enabled.get() && profiler_triggered {
+            if let Some(key) = plan_key.as_ref() {
+                self.jit_manager
+                    .borrow_mut()
+                    .prepare_filter(key.clone(), table, predicate)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut matching_indices = if let Some(kernel) = filter_kernel {
+            kernel.execute(table, &candidate_indices)
+        } else {
+            let mut matches = Vec::with_capacity(candidate_indices.len());
+            for &row_index in &candidate_indices {
+                if let Some(predicate) = predicate {
+                    let row = &table.rows[row_index];
+                    if !self.evaluate_predicate(table, predicate, row, cte_tables)? {
+                        continue;
+                    }
+                }
+                matches.push(row_index);
+            }
+            matches
+        };
+
+        let projection_kernel = if self.jit_enabled.get() && profiler_triggered {
+            if let Some(key) = plan_key.as_ref() {
+                self.jit_manager.borrow_mut().prepare_projection(
+                    key.clone(),
+                    table,
+                    &projection.columns,
+                )?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let result = match &projection.columns {
             SelectColumns::All => {
-                let column_names = table.columns.iter().map(|c| c.name.clone()).collect();
-                let rows = matching_indices
-                    .iter()
-                    .map(|&idx| table.rows[idx].clone())
-                    .collect();
-                QueryResult::Rows {
-                    columns: column_names,
-                    rows,
+                if let Some(kernel) = projection_kernel.as_ref() {
+                    let rows = kernel.execute(table, &matching_indices);
+                    let columns = kernel.column_names().to_vec();
+                    QueryResult::Rows { columns, rows }
+                } else {
+                    let column_names = table.columns.iter().map(|c| c.name.clone()).collect();
+                    let rows = matching_indices
+                        .iter()
+                        .map(|&idx| table.rows[idx].clone())
+                        .collect();
+                    QueryResult::Rows {
+                        columns: column_names,
+                        rows,
+                    }
                 }
             }
             SelectColumns::Some(items) => {
-                let mut projections = Vec::new();
-                let mut window_specs = Vec::new();
+                if let Some(kernel) = projection_kernel.as_ref() {
+                    let rows = kernel.execute(table, &matching_indices);
+                    let columns = kernel.column_names().to_vec();
+                    QueryResult::Rows { columns, rows }
+                } else {
+                    let mut projections = Vec::new();
+                    let mut window_specs = Vec::new();
 
-                for item in items {
-                    match item {
-                        SelectItem::Column(name) => {
-                            let idx = self.column_index(table, name)?;
-                            let output_name = table.columns[idx].name.clone();
-                            projections.push(PreparedProjection {
-                                output_name,
-                                kind: ProjectionKind::Column { index: idx },
-                            });
-                        }
-                        SelectItem::WindowFunction(spec) => {
-                            let window_index = window_specs.len();
-                            let output_name = spec
-                                .alias
-                                .clone()
-                                .unwrap_or_else(|| spec.function.default_alias().to_string());
-                            window_specs.push(spec.clone());
-                            projections.push(PreparedProjection {
-                                output_name,
-                                kind: ProjectionKind::Window {
-                                    index: window_index,
-                                },
-                            });
-                        }
-                    }
-                }
-
-                let mut window_values = Vec::new();
-                for spec in &window_specs {
-                    let values = self.compute_window_function(table, &matching_indices, spec)?;
-                    window_values.push(values);
-                }
-
-                let mut rows = Vec::with_capacity(matching_indices.len());
-                for (position, &row_index) in matching_indices.iter().enumerate() {
-                    let row = &table.rows[row_index];
-                    let mut output_row = Vec::with_capacity(projections.len());
-                    for projection in &projections {
-                        match &projection.kind {
-                            ProjectionKind::Column { index } => {
-                                output_row.push(row[*index].clone());
+                    for item in items {
+                        match item {
+                            SelectItem::Column(name) => {
+                                let idx = self.column_index(table, name)?;
+                                let output_name = table.columns[idx].name.clone();
+                                projections.push(PreparedProjection {
+                                    output_name,
+                                    kind: ProjectionKind::Column { index: idx },
+                                });
                             }
-                            ProjectionKind::Window { index } => {
-                                output_row.push(window_values[*index][position].clone());
+                            SelectItem::WindowFunction(spec) => {
+                                let window_index = window_specs.len();
+                                let output_name = spec
+                                    .alias
+                                    .clone()
+                                    .unwrap_or_else(|| spec.function.default_alias().to_string());
+                                window_specs.push(spec.clone());
+                                projections.push(PreparedProjection {
+                                    output_name,
+                                    kind: ProjectionKind::Window {
+                                        index: window_index,
+                                    },
+                                });
                             }
                         }
                     }
-                    rows.push(output_row);
+
+                    let mut window_values = Vec::new();
+                    for spec in &window_specs {
+                        let values =
+                            self.compute_window_function(table, &matching_indices, spec)?;
+                        window_values.push(values);
+                    }
+
+                    let mut rows = Vec::with_capacity(matching_indices.len());
+                    for (position, &row_index) in matching_indices.iter().enumerate() {
+                        let row = &table.rows[row_index];
+                        let mut output_row = Vec::with_capacity(projections.len());
+                        for projection in &projections {
+                            match &projection.kind {
+                                ProjectionKind::Column { index } => {
+                                    output_row.push(row[*index].clone());
+                                }
+                                ProjectionKind::Window { index } => {
+                                    output_row.push(window_values[*index][position].clone());
+                                }
+                            }
+                        }
+                        rows.push(output_row);
+                    }
+
+                    let columns = projections
+                        .into_iter()
+                        .map(|projection| projection.output_name)
+                        .collect();
+
+                    QueryResult::Rows { columns, rows }
                 }
-
-                let columns = projections
-                    .into_iter()
-                    .map(|projection| projection.output_name)
-                    .collect();
-
-                QueryResult::Rows { columns, rows }
             }
         };
 
@@ -1008,21 +1082,29 @@ impl SqlDatabase {
     }
 
     fn invalidate_cache_for_table(&self, table: &str) {
-        let mut index = self.plan_cache_index.borrow_mut();
-        if let Some(keys) = index.remove(table) {
-            let key_list: Vec<_> = keys.into_iter().collect();
-            {
-                let mut cache = self.plan_cache.borrow_mut();
-                for key in &key_list {
-                    cache.remove(key);
+        let key_list = {
+            let mut index = self.plan_cache_index.borrow_mut();
+            if let Some(keys) = index.remove(table) {
+                let key_list: Vec<_> = keys.into_iter().collect();
+                {
+                    let mut cache = self.plan_cache.borrow_mut();
+                    for key in &key_list {
+                        cache.remove(key);
+                    }
                 }
-            }
-            for entries in index.values_mut() {
-                for key in &key_list {
-                    entries.remove(key);
+                for entries in index.values_mut() {
+                    for key in &key_list {
+                        entries.remove(key);
+                    }
                 }
+                key_list
+            } else {
+                return;
             }
-        }
+        };
+
+        self.jit_manager.borrow_mut().invalidate_keys(&key_list);
+        self.loop_profiler.borrow_mut().invalidate_keys(&key_list);
     }
 
     fn plan_cache_metadata(
@@ -1735,13 +1817,13 @@ enum Statement {
 }
 
 #[derive(Debug, Clone)]
-enum SelectColumns {
+pub(crate) enum SelectColumns {
     All,
     Some(Vec<SelectItem>),
 }
 
 #[derive(Debug, Clone)]
-enum SelectItem {
+pub(crate) enum SelectItem {
     Column(String),
     WindowFunction(WindowFunctionExpr),
 }
@@ -1780,7 +1862,7 @@ impl WindowFunctionType {
 }
 
 #[derive(Debug, Clone)]
-enum Predicate {
+pub(crate) enum Predicate {
     Equals {
         column: String,
         value: Value,
