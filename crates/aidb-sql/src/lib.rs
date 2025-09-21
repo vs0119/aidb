@@ -1,14 +1,14 @@
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Bound::Included;
-
 use chrono::Datelike;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use roxmltree::Document;
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde_json::Value as JsonValue;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use thiserror::Error;
+
+mod planner;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -25,13 +25,13 @@ pub enum Value {
 }
 
 #[derive(Debug, Clone)]
-struct Column {
-    name: String,
-    ty: ColumnType,
+pub(crate) struct Column {
+    pub(crate) name: String,
+    pub(crate) ty: ColumnType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColumnType {
+pub(crate) enum ColumnType {
     Integer,
     Float,
     Text,
@@ -58,15 +58,15 @@ fn column_type_name(ty: ColumnType) -> &'static str {
 }
 
 #[derive(Debug, Clone)]
-struct Table {
-    columns: Vec<Column>,
-    rows: Vec<Vec<Value>>,
-    partitioning: Option<TimePartitioning>,
-    partitions: BTreeMap<PartitionKey, Vec<usize>>,
-    json_indexes: HashMap<usize, JsonIndex>,
-    jsonb_indexes: HashMap<usize, JsonIndex>,
-    xml_indexes: HashMap<usize, XmlIndex>,
-    spatial_indexes: HashMap<usize, SpatialIndex>,
+pub(crate) struct Table {
+    pub(crate) columns: Vec<Column>,
+    pub(crate) rows: Vec<Vec<Value>>,
+    pub(crate) partitioning: Option<TimePartitioning>,
+    pub(crate) partitions: BTreeMap<PartitionKey, Vec<usize>>,
+    pub(crate) json_indexes: HashMap<usize, JsonIndex>,
+    pub(crate) jsonb_indexes: HashMap<usize, JsonIndex>,
+    pub(crate) xml_indexes: HashMap<usize, XmlIndex>,
+    pub(crate) spatial_indexes: HashMap<usize, SpatialIndex>,
 }
 
 impl Default for Table {
@@ -124,22 +124,22 @@ impl Geometry {
 }
 
 #[derive(Debug, Clone, Default)]
-struct JsonIndex {
-    map: HashMap<String, Vec<usize>>,
+pub(crate) struct JsonIndex {
+    pub(crate) map: HashMap<String, Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Default)]
-struct XmlIndex {
-    map: HashMap<String, Vec<usize>>,
+pub(crate) struct XmlIndex {
+    pub(crate) map: HashMap<String, Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Default)]
-struct SpatialIndex {
-    tree: RTree<SpatialIndexItem>,
+pub(crate) struct SpatialIndex {
+    pub(crate) tree: RTree<SpatialIndexItem>,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SpatialIndexItem {
+pub(crate) struct SpatialIndexItem {
     row: usize,
     bbox: AABB<[f64; 2]>,
 }
@@ -180,7 +180,7 @@ struct GraphEdge {
 }
 
 #[derive(Debug, Clone)]
-struct TimePartitioning {
+pub(crate) struct TimePartitioning {
     column_index: usize,
     column_name: String,
     granularity: PartitionGranularity,
@@ -638,22 +638,37 @@ impl SqlDatabase {
         select: &SelectStatement,
     ) -> Result<QueryResult, SqlDatabaseError> {
         if let Some(table) = cte_tables.get(&select.table) {
-            self.exec_select_from_table(
+            let resolved = planner::ResolvedTable::new(
+                select.table.as_str(),
+                planner::TableSource::Cte,
                 table,
+            );
+            self.exec_select_from_table(
+                resolved,
                 &select.columns,
                 select.predicate.as_ref(),
                 cte_tables,
             )
         } else if let Some(table) = self.tables.get(&select.table) {
-            self.exec_select_from_table(
+            let resolved = planner::ResolvedTable::new(
+                select.table.as_str(),
+                planner::TableSource::Base,
                 table,
+            );
+            self.exec_select_from_table(
+                resolved,
                 &select.columns,
                 select.predicate.as_ref(),
                 cte_tables,
             )
         } else if let Some(table) = self.system_tables.get(&select.table) {
-            self.exec_select_from_table(
+            let resolved = planner::ResolvedTable::new(
+                select.table.as_str(),
+                planner::TableSource::System,
                 table,
+            );
+            self.exec_select_from_table(
+                resolved,
                 &select.columns,
                 select.predicate.as_ref(),
                 cte_tables,
@@ -665,132 +680,42 @@ impl SqlDatabase {
 
     fn exec_select_from_table(
         &self,
-        table: &Table,
+        table_ref: planner::ResolvedTable,
         columns: &SelectColumns,
         predicate: Option<&Predicate>,
         cte_tables: &HashMap<String, Table>,
     ) -> Result<QueryResult, SqlDatabaseError> {
-        let mut candidate_indices: Option<Vec<usize>> = None;
-        if let Some(predicate) = predicate {
-            if let Some(partitioning) = &table.partitioning {
-                if partitioning.matches_column(predicate.column_name()) {
-                    match predicate {
-                        Predicate::Equals { value, .. } => {
-                            let idx = partitioning.column_index;
-                            let column_type = table.columns[idx].ty;
-                            let coerced = coerce_static_value(value, column_type)?;
-                            if let Some(key) = partitioning.partition_key(&coerced) {
-                                if let Some(part_rows) = table.partitions.get(&key) {
-                                    candidate_indices = Some(part_rows.clone());
-                                } else {
-                                    candidate_indices = Some(Vec::new());
-                                }
-                            } else {
-                                candidate_indices = Some(Vec::new());
-                            }
-                        }
-                        Predicate::Between { start, end, .. } => {
-                            let idx = partitioning.column_index;
-                            let column_type = table.columns[idx].ty;
-                            let start_val = coerce_static_value(start, column_type)?;
-                            let end_val = coerce_static_value(end, column_type)?;
-                            if let (Some(start_key), Some(end_key)) = (
-                                partitioning.partition_key(&start_val),
-                                partitioning.partition_key(&end_val),
-                            ) {
-                                let (lower, upper) = if start_key <= end_key {
-                                    (start_key, end_key)
-                                } else {
-                                    (end_key, start_key)
-                                };
-                                let mut indices = Vec::new();
-                                for rows in table
-                                    .partitions
-                                    .range((Included(lower), Included(upper)))
-                                    .map(|(_, v)| v)
-                                {
-                                    indices.extend(rows.iter().copied());
-                                }
-                                candidate_indices = Some(indices);
-                            } else {
-                                candidate_indices = Some(Vec::new());
-                            }
-                        }
-                        Predicate::IsNull { .. }
-                        | Predicate::InTableColumn { .. }
-                        | Predicate::FullText { .. } => {}
-                    }
-                }
-            }
+        let context = planner::PlanContext::new(table_ref);
+        let mut builder = planner::LogicalPlanBuilder::scan(table_ref);
+        if let Some(pred) = predicate.cloned() {
+            builder = builder.filter(pred);
         }
-        if candidate_indices.is_none() {
-            if let Some(Predicate::Equals { column, value }) = predicate {
-                let idx = column_index_in_table(table, column)?;
-                match table.columns[idx].ty {
-                    ColumnType::Json => {
-                        if let Some(index) = table.json_indexes.get(&idx) {
-                            let coerced = coerce_static_value(value, ColumnType::Json)?;
-                            if let Value::Json(json) = coerced {
-                                let key = canonical_json(&json);
-                                if let Some(rows) = index.map.get(&key) {
-                                    candidate_indices = Some(rows.clone());
-                                } else {
-                                    candidate_indices = Some(Vec::new());
-                                }
-                            }
-                        }
-                    }
-                    ColumnType::Jsonb => {
-                        if let Some(index) = table.jsonb_indexes.get(&idx) {
-                            let coerced = coerce_static_value(value, ColumnType::Jsonb)?;
-                            if let Value::Jsonb(json) = coerced {
-                                let key = canonical_json(&json);
-                                if let Some(rows) = index.map.get(&key) {
-                                    candidate_indices = Some(rows.clone());
-                                } else {
-                                    candidate_indices = Some(Vec::new());
-                                }
-                            }
-                        }
-                    }
-                    ColumnType::Xml => {
-                        if let Some(index) = table.xml_indexes.get(&idx) {
-                            let coerced = coerce_static_value(value, ColumnType::Xml)?;
-                            if let Value::Xml(xml) = coerced {
-                                if let Some(root) = xml_root_name(&xml) {
-                                    if let Some(rows) = index.map.get(&root) {
-                                        candidate_indices = Some(rows.clone());
-                                    } else {
-                                        candidate_indices = Some(Vec::new());
-                                    }
-                                } else {
-                                    candidate_indices = Some(Vec::new());
-                                }
-                            }
-                        }
-                    }
-                    ColumnType::Geometry => {
-                        if let Some(index) = table.spatial_indexes.get(&idx) {
-                            let coerced = coerce_static_value(value, ColumnType::Geometry)?;
-                            if let Value::Geometry(geom) = coerced {
-                                let mut rows = Vec::new();
-                                let envelope = geom.to_aabb();
-                                for item in index.tree.locate_in_envelope_intersecting(&envelope) {
-                                    rows.push(item.row);
-                                }
-                                rows.sort_unstable();
-                                rows.dedup();
-                                candidate_indices = Some(rows);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let plan = builder.project(columns.clone()).build();
+        let planner = planner::Planner::new(context);
+        let optimized = planner.optimize(plan)?;
+        self.execute_select_plan(&optimized.root, cte_tables)
+    }
 
-        let iter: Box<dyn Iterator<Item = usize>> = match candidate_indices {
-            Some(indices) => Box::new(indices.into_iter()),
+    fn execute_select_plan(
+        &self,
+        expr: &planner::LogicalExpr,
+        cte_tables: &HashMap<String, Table>,
+    ) -> Result<QueryResult, SqlDatabaseError> {
+        let (projection, predicate, scan) = match expr {
+            planner::LogicalExpr::Projection(projection) => match projection.input.as_ref() {
+                planner::LogicalExpr::Filter(filter) => match filter.input.as_ref() {
+                    planner::LogicalExpr::Scan(scan) => (projection, Some(&filter.predicate), scan),
+                    _ => return Err(SqlDatabaseError::Unsupported),
+                },
+                planner::LogicalExpr::Scan(scan) => (projection, None, scan),
+                _ => return Err(SqlDatabaseError::Unsupported),
+            },
+            _ => return Err(SqlDatabaseError::Unsupported),
+        };
+
+        let table = scan.table.table;
+        let iter: Box<dyn Iterator<Item = usize>> = match scan.candidates.as_slice() {
+            Some(rows) => Box::new(rows.iter().copied()),
             None => Box::new(0..table.rows.len()),
         };
 
@@ -805,7 +730,7 @@ impl SqlDatabase {
             matching_indices.push(row_index);
         }
 
-        match columns {
+        match &projection.columns {
             SelectColumns::All => {
                 let column_names = table.columns.iter().map(|c| c.name.clone()).collect();
                 let rows = matching_indices
@@ -2729,7 +2654,7 @@ fn update_indexes_for_row(table: &mut Table, row_index: usize) {
     }
 }
 
-fn canonical_json(value: &JsonValue) -> String {
+pub(crate) fn canonical_json(value: &JsonValue) -> String {
     match value {
         JsonValue::Null => "null".to_string(),
         JsonValue::Bool(b) => b.to_string(),
@@ -2770,7 +2695,7 @@ fn normalize_json(value: JsonValue) -> JsonValue {
     }
 }
 
-fn xml_root_name(xml: &str) -> Option<String> {
+pub(crate) fn xml_root_name(xml: &str) -> Option<String> {
     Document::parse(xml)
         .ok()
         .map(|doc| doc.root_element().tag_name().name().to_string())
@@ -3622,7 +3547,10 @@ fn coerce_value(value: Value, target: ColumnType) -> Result<Value, SqlDatabaseEr
     }
 }
 
-fn coerce_static_value(value: &Value, target: ColumnType) -> Result<Value, SqlDatabaseError> {
+pub(crate) fn coerce_static_value(
+    value: &Value,
+    target: ColumnType,
+) -> Result<Value, SqlDatabaseError> {
     coerce_value(value.clone(), target)
 }
 
@@ -3771,7 +3699,12 @@ fn timestamp_from_float(value: f64) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
+    use super::planner::{
+        LogicalExpr, LogicalPlanBuilder, PlanContext, Planner, ResolvedTable, ScanCandidates,
+        TableSource,
+    };
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn create_insert_select_flow() {
@@ -4388,5 +4321,152 @@ mod tests {
         assert!(
             matches!(err, Err(SqlDatabaseError::SystemTableModification(name)) if name == "__aidb_table_stats")
         );
+    }
+
+    fn optimized_plan_for<'a>(
+        db: &'a SqlDatabase,
+        table_name: &'a str,
+        predicate: Option<Predicate>,
+        columns: SelectColumns,
+    ) -> planner::LogicalPlan<'a> {
+        let table = db
+            .tables
+            .get(table_name)
+            .unwrap_or_else(|| panic!("table {table_name} not found"));
+        let resolved = ResolvedTable::new(table_name, TableSource::Base, table);
+        let context = PlanContext::new(resolved);
+        let mut builder = LogicalPlanBuilder::scan(resolved);
+        if let Some(pred) = predicate {
+            builder = builder.filter(pred);
+        }
+        let plan = builder.project(columns).build();
+        Planner::new(context)
+            .optimize(plan)
+            .expect("plan optimization should succeed")
+    }
+
+    fn plan_components<'a>(
+        plan: &'a planner::LogicalPlan<'a>,
+    ) -> (&'a SelectColumns, Option<&'a Predicate>, &'a ScanCandidates) {
+        match &plan.root {
+            LogicalExpr::Projection(projection) => match projection.input.as_ref() {
+                LogicalExpr::Filter(filter) => match filter.input.as_ref() {
+                    LogicalExpr::Scan(scan) => (
+                        &projection.columns,
+                        Some(&filter.predicate),
+                        &scan.candidates,
+                    ),
+                    _ => panic!("unexpected logical plan shape"),
+                },
+                LogicalExpr::Scan(scan) => (&projection.columns, None, &scan.candidates),
+                _ => panic!("unexpected logical plan shape"),
+            },
+            _ => panic!("unexpected logical plan root"),
+        }
+    }
+
+    #[test]
+    fn planner_partition_pruning_selects_partition_rows() {
+        let mut db = SqlDatabase::new();
+        db.execute(
+            "CREATE TABLE events (id INT, event_time TIMESTAMP) PARTITION BY DAY(event_time);",
+        )
+        .unwrap();
+        db.execute("INSERT INTO events VALUES (1, '2024-01-01T00:00:00Z');")
+            .unwrap();
+        db.execute("INSERT INTO events VALUES (2, '2024-01-02T00:00:00Z');")
+            .unwrap();
+
+        let predicate = Predicate::Equals {
+            column: "event_time".to_string(),
+            value: Value::Timestamp(
+                Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0)
+                    .single()
+                    .expect("valid timestamp"),
+            ),
+        };
+
+        let plan = optimized_plan_for(&db, "events", Some(predicate), SelectColumns::All);
+        let (_, _, candidates) = plan_components(&plan);
+
+        match candidates {
+            ScanCandidates::Fixed(rows) => assert_eq!(rows.as_slice(), &[0]),
+            other => panic!("expected partition pruning, got {other:?}"),
+        }
+
+        let result = db
+            .execute("SELECT id FROM events WHERE event_time = '2024-01-01T00:00:00Z';")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn planner_json_index_selects_index_hits() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE docs (id INT, data JSON);")
+            .unwrap();
+        db.execute("INSERT INTO docs VALUES (1, JSON '{\"k\":1}');")
+            .unwrap();
+        db.execute("INSERT INTO docs VALUES (2, JSON '{\"k\":2}');")
+            .unwrap();
+
+        let predicate = Predicate::Equals {
+            column: "data".to_string(),
+            value: Value::Json(json!({ "k": 1 })),
+        };
+
+        let plan = optimized_plan_for(
+            &db,
+            "docs",
+            Some(predicate),
+            SelectColumns::Some(vec![SelectItem::Column("id".into())]),
+        );
+        let (_, _, candidates) = plan_components(&plan);
+
+        match candidates {
+            ScanCandidates::Fixed(rows) => assert_eq!(rows.as_slice(), &[0]),
+            other => panic!("expected json index usage, got {other:?}"),
+        }
+
+        let result = db
+            .execute("SELECT id FROM docs WHERE data = JSON '{\"k\":1}';")
+            .unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[test]
+    fn planner_without_predicate_scans_all_rows() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE metrics (id INT, score INT);")
+            .unwrap();
+        db.execute("INSERT INTO metrics VALUES (1, 10), (2, 20);")
+            .unwrap();
+
+        let plan = optimized_plan_for(&db, "metrics", None, SelectColumns::All);
+        let (_, predicate, candidates) = plan_components(&plan);
+
+        assert!(predicate.is_none());
+        match candidates {
+            ScanCandidates::AllRows => {}
+            other => panic!("expected full scan, got {other:?}"),
+        }
+
+        let result = db.execute("SELECT * FROM metrics;").unwrap();
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("unexpected result"),
+        }
     }
 }
