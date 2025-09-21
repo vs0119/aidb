@@ -1,6 +1,11 @@
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::c_void;
+use std::io;
 use std::ops::Bound::Included;
+use std::os::raw::c_int;
+use std::sync::Arc;
 
 use chrono::Datelike;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -53,6 +58,7 @@ struct Table {
     jsonb_indexes: HashMap<usize, JsonIndex>,
     xml_indexes: HashMap<usize, XmlIndex>,
     spatial_indexes: HashMap<usize, SpatialIndex>,
+    statistics: TableStatistics,
 }
 
 impl Default for Table {
@@ -66,6 +72,7 @@ impl Default for Table {
             jsonb_indexes: HashMap::new(),
             xml_indexes: HashMap::new(),
             spatial_indexes: HashMap::new(),
+            statistics: TableStatistics::default(),
         }
     }
 }
@@ -131,6 +138,592 @@ impl PointDistance for SpatialIndexItem {
     fn distance_2(&self, point: &[f64; 2]) -> f64 {
         self.bbox.distance_2(point)
     }
+}
+
+#[derive(Debug, Clone)]
+struct TableStatistics {
+    columns: Vec<ColumnStatistics>,
+    row_count: usize,
+}
+
+impl Default for TableStatistics {
+    fn default() -> Self {
+        Self {
+            columns: Vec::new(),
+            row_count: 0,
+        }
+    }
+}
+
+impl TableStatistics {
+    fn initialize(&mut self, column_types: &[ColumnType]) {
+        self.columns = column_types
+            .iter()
+            .map(|ty| ColumnStatistics::new(*ty))
+            .collect();
+        self.row_count = 0;
+    }
+
+    fn update_row(&mut self, row: &[Value]) {
+        if self.columns.is_empty() {
+            return;
+        }
+        self.row_count += 1;
+        for (idx, value) in row.iter().enumerate() {
+            if let Some(stat) = self.columns.get_mut(idx) {
+                stat.update_value(value);
+            }
+        }
+    }
+
+    fn recompute(&mut self, rows: &[Vec<Value>]) {
+        for column in &mut self.columns {
+            column.reset();
+        }
+        self.row_count = 0;
+        for row in rows {
+            self.update_row(row);
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    fn column_selectivity(&self, index: usize, predicate: &Predicate) -> Option<f64> {
+        if index >= self.columns.len() || self.row_count == 0 {
+            return None;
+        }
+        let total = self.row_count as f64;
+        self.columns[index].estimate_selectivity(predicate, total)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ColumnStatistics {
+    column_type: ColumnType,
+    null_count: usize,
+    value_count: usize,
+    distinct_tracker: DistinctTracker,
+    histogram: Option<Histogram>,
+}
+
+impl ColumnStatistics {
+    fn new(column_type: ColumnType) -> Self {
+        let histogram = match column_type {
+            ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp => {
+                Some(Histogram::new(16))
+            }
+            _ => None,
+        };
+        Self {
+            column_type,
+            null_count: 0,
+            value_count: 0,
+            distinct_tracker: DistinctTracker::new(1024),
+            histogram,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.null_count = 0;
+        self.value_count = 0;
+        self.distinct_tracker.clear();
+        if let Some(hist) = &mut self.histogram {
+            hist.clear();
+        }
+    }
+
+    fn update_value(&mut self, value: &Value) {
+        if matches!(value, Value::Null) {
+            self.null_count += 1;
+            return;
+        }
+        self.value_count += 1;
+        let key = statistics_key(value);
+        self.distinct_tracker.record(key);
+        if let Some(hist) = &mut self.histogram {
+            if let Some(float_value) = value_to_f64(value) {
+                hist.add_value(float_value);
+            }
+        }
+    }
+
+    fn estimate_selectivity(&self, predicate: &Predicate, total_rows: f64) -> Option<f64> {
+        if total_rows == 0.0 {
+            return Some(0.0);
+        }
+        match predicate {
+            Predicate::Equals { value, .. } => {
+                if let Some(freq) = self.distinct_tracker.frequency(value) {
+                    return Some(freq as f64 / total_rows);
+                }
+                if let Some(hist) = &self.histogram {
+                    if let Some(point) = value_to_f64(value) {
+                        return Some(hist.estimate_point(point));
+                    }
+                }
+                let distinct = self.distinct_tracker.distinct_count();
+                if distinct > 0 {
+                    Some(1.0 / distinct as f64)
+                } else {
+                    Some(1.0 / total_rows.max(1.0))
+                }
+            }
+            Predicate::Between { start, end, .. } => {
+                if let Some(hist) = &self.histogram {
+                    if let (Some(start), Some(end)) = (value_to_f64(start), value_to_f64(end)) {
+                        return Some(hist.estimate_range(start, end));
+                    }
+                }
+                None
+            }
+            Predicate::IsNull { .. } => Some(self.null_count as f64 / total_rows),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DistinctTracker {
+    counts: HashMap<String, usize>,
+    max_entries: usize,
+}
+
+impl DistinctTracker {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            counts: HashMap::new(),
+            max_entries,
+        }
+    }
+
+    fn record(&mut self, key: String) {
+        if self.counts.len() < self.max_entries || self.counts.contains_key(&key) {
+            *self.counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    fn frequency(&self, value: &Value) -> Option<usize> {
+        let key = statistics_key(value);
+        self.counts.get(&key).copied()
+    }
+
+    fn distinct_count(&self) -> usize {
+        self.counts.len()
+    }
+
+    fn clear(&mut self) {
+        self.counts.clear();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Histogram {
+    buckets: Vec<HistogramBucket>,
+    samples: Vec<f64>,
+    max_samples: usize,
+    bucket_count: usize,
+}
+
+impl Histogram {
+    fn new(bucket_count: usize) -> Self {
+        Self {
+            buckets: Vec::new(),
+            samples: Vec::new(),
+            max_samples: 2048,
+            bucket_count: bucket_count.max(1),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buckets.clear();
+        self.samples.clear();
+    }
+
+    fn add_value(&mut self, value: f64) {
+        self.samples.push(value);
+        if self.samples.len() > self.max_samples {
+            self.samples.remove(0);
+        }
+        self.rebuild();
+    }
+
+    fn rebuild(&mut self) {
+        if self.samples.is_empty() {
+            self.buckets.clear();
+            return;
+        }
+        let mut sorted = self.samples.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        self.buckets.clear();
+        let chunk_size = (sorted.len() / self.bucket_count).max(1);
+        for chunk in sorted.chunks(chunk_size) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let lower = *chunk.first().unwrap();
+            let upper = *chunk.last().unwrap();
+            self.buckets.push(HistogramBucket {
+                lower,
+                upper,
+                count: chunk.len(),
+            });
+        }
+    }
+
+    fn estimate_point(&self, value: f64) -> f64 {
+        if self.buckets.is_empty() {
+            return 0.0;
+        }
+        let total: usize = self.buckets.iter().map(|b| b.count).sum();
+        for bucket in &self.buckets {
+            if value >= bucket.lower && value <= bucket.upper {
+                return bucket.count as f64 / total.max(1) as f64;
+            }
+        }
+        1.0 / self.buckets.len() as f64
+    }
+
+    fn estimate_range(&self, start: f64, end: f64) -> f64 {
+        if self.buckets.is_empty() {
+            return 0.0;
+        }
+        let total: usize = self.buckets.iter().map(|b| b.count).sum();
+        if total == 0 {
+            return 0.0;
+        }
+        let (low, high) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let mut count = 0.0;
+        for bucket in &self.buckets {
+            if high < bucket.lower || low > bucket.upper {
+                continue;
+            }
+            if (bucket.upper - bucket.lower).abs() < f64::EPSILON {
+                if low <= bucket.lower && bucket.lower <= high {
+                    count += bucket.count as f64;
+                }
+                continue;
+            }
+            let overlap_start = low.max(bucket.lower);
+            let overlap_end = high.min(bucket.upper);
+            if overlap_start > overlap_end {
+                continue;
+            }
+            let fraction = (overlap_end - overlap_start) / (bucket.upper - bucket.lower);
+            count += fraction * bucket.count as f64;
+        }
+        (count / total as f64).min(1.0)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HistogramBucket {
+    lower: f64,
+    upper: f64,
+    count: usize,
+}
+
+fn statistics_key(value: &Value) -> String {
+    match value {
+        Value::Integer(i) => format!("i:{i}"),
+        Value::Float(f) => format!("f:{:x}", f.to_bits()),
+        Value::Text(s) => format!("t:{}", s.to_ascii_lowercase()),
+        Value::Boolean(b) => format!("b:{}", if *b { 1 } else { 0 }),
+        Value::Timestamp(ts) => format!("ts:{}", ts.timestamp_millis()),
+        Value::Json(v) => format!("json:{}", canonical_json(v)),
+        Value::Jsonb(v) => format!("jsonb:{}", canonical_json(v)),
+        Value::Xml(s) => format!("xml:{}", s.to_ascii_lowercase()),
+        Value::Geometry(g) => format!("geom:{:?}", g),
+        Value::Null => "null".into(),
+    }
+}
+
+fn value_to_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Integer(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        Value::Timestamp(ts) => Some(ts.timestamp_millis() as f64),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PlanCandidate {
+    strategy: ScanStrategy,
+    indices: Vec<usize>,
+}
+
+impl PlanCandidate {
+    fn new(strategy: ScanStrategy, mut indices: Vec<usize>) -> Self {
+        indices.sort_unstable();
+        indices.dedup();
+        Self { strategy, indices }
+    }
+
+    fn estimated_cost(&self, total_rows: f64) -> f64 {
+        let base = self.indices.len() as f64;
+        let penalty = match self.strategy {
+            ScanStrategy::PartitionPruned => 1.1,
+            ScanStrategy::JsonIndex
+            | ScanStrategy::JsonbIndex
+            | ScanStrategy::XmlIndex
+            | ScanStrategy::SpatialIndex => 1.2,
+            ScanStrategy::Sequential => 1.0,
+        };
+        base * penalty + total_rows * 0.01
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ScanStrategy {
+    Sequential,
+    PartitionPruned,
+    JsonIndex,
+    JsonbIndex,
+    XmlIndex,
+    SpatialIndex,
+}
+
+#[derive(Debug, Clone)]
+enum ScanPlan {
+    Sequential,
+    Index(Vec<usize>),
+}
+
+#[derive(Debug, Default, Clone)]
+struct StrategyStats {
+    last_cost: f64,
+    last_cardinality: f64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RuntimeFeedback {
+    per_strategy: HashMap<ScanStrategy, StrategyStats>,
+}
+
+impl RuntimeFeedback {
+    fn update(&mut self, strategy: ScanStrategy, cost: f64, cardinality: f64) {
+        self.per_strategy.insert(
+            strategy,
+            StrategyStats {
+                last_cost: cost,
+                last_cardinality: cardinality,
+            },
+        );
+    }
+}
+
+#[derive(Debug, Default)]
+struct CostBasedOptimizer {
+    runtime_feedback: HashMap<String, RuntimeFeedback>,
+}
+
+impl CostBasedOptimizer {
+    fn choose_plan(
+        &mut self,
+        table_name: Option<&str>,
+        table: &Table,
+        predicate: Option<&Predicate>,
+        candidates: &[PlanCandidate],
+    ) -> (ScanPlan, ScanStrategy, Option<f64>) {
+        let row_count = table.statistics.row_count() as f64;
+        let mut best_plan = ScanPlan::Sequential;
+        let mut best_strategy = ScanStrategy::Sequential;
+        let mut best_cost = row_count;
+        let mut best_estimate = predicate
+            .and_then(|p| {
+                let column = p.column_name();
+                table
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(column))
+                    .and_then(|idx| table.statistics.column_selectivity(idx, p))
+                    .map(|sel| sel * row_count)
+            })
+            .or_else(|| {
+                if predicate.is_some() {
+                    Some(row_count)
+                } else {
+                    None
+                }
+            });
+
+        let feedback_key = table_name.and_then(|name| {
+            predicate.map(|p| format!("{}::{}", name.to_ascii_lowercase(), p.signature()))
+        });
+
+        if let Some(key) = &feedback_key {
+            if let Some(feedback) = self.runtime_feedback.get(key) {
+                if let Some(stats) = feedback.per_strategy.get(&ScanStrategy::Sequential) {
+                    best_cost = stats.last_cost.max(1.0);
+                    best_estimate = Some(stats.last_cardinality.max(1.0));
+                }
+            }
+        }
+
+        for candidate in candidates {
+            let mut candidate_cost = candidate.estimated_cost(row_count);
+            let mut estimate = candidate.indices.len() as f64;
+            if let Some(key) = &feedback_key {
+                if let Some(feedback) = self.runtime_feedback.get(key) {
+                    if let Some(stats) = feedback.per_strategy.get(&candidate.strategy) {
+                        candidate_cost = stats.last_cost.max(1.0);
+                        estimate = stats.last_cardinality.max(1.0);
+                    }
+                }
+            }
+            if candidate_cost < best_cost {
+                best_cost = candidate_cost;
+                best_plan = ScanPlan::Index(candidate.indices.clone());
+                best_strategy = candidate.strategy;
+                best_estimate = Some(estimate);
+            }
+        }
+
+        (best_plan, best_strategy, best_estimate)
+    }
+
+    fn record_feedback(
+        &mut self,
+        table_name: &str,
+        predicate: &Predicate,
+        actual_cost: usize,
+        actual_cardinality: usize,
+        strategy: ScanStrategy,
+    ) {
+        let key = format!(
+            "{}::{}",
+            table_name.to_ascii_lowercase(),
+            predicate.signature()
+        );
+        let entry = self
+            .runtime_feedback
+            .entry(key)
+            .or_insert_with(RuntimeFeedback::default);
+        entry.update(strategy, actual_cost as f64, actual_cardinality as f64);
+    }
+}
+
+#[derive(Clone)]
+struct JitContext {
+    column_index: usize,
+    compiled: Arc<JitCompiledPredicate>,
+}
+
+impl std::fmt::Debug for JitContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitContext")
+            .field("column_index", &self.column_index)
+            .finish()
+    }
+}
+
+#[derive(Debug, Default)]
+struct JitCompiler {
+    cache: HashMap<String, Arc<JitCompiledPredicate>>,
+}
+
+impl JitCompiler {
+    fn get_or_compile(&mut self, key: &str, constant: i64) -> Option<Arc<JitCompiledPredicate>> {
+        if let Some(existing) = self.cache.get(key) {
+            return Some(existing.clone());
+        }
+        match JitCompiledPredicate::compile(constant) {
+            Ok(compiled) => {
+                let compiled = Arc::new(compiled);
+                self.cache.insert(key.to_string(), compiled.clone());
+                Some(compiled)
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+struct JitCompiledPredicate {
+    ptr: *mut c_void,
+    len: usize,
+    func: unsafe extern "C" fn(i64) -> i32,
+}
+
+impl std::fmt::Debug for JitCompiledPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JitCompiledPredicate")
+    }
+}
+
+impl Drop for JitCompiledPredicate {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(self.ptr, self.len);
+        }
+    }
+}
+
+impl JitCompiledPredicate {
+    fn compile(constant: i64) -> Result<Self, io::Error> {
+        const CODE_SIZE: usize = 20;
+        unsafe {
+            let ptr = mmap(
+                std::ptr::null_mut(),
+                CODE_SIZE,
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+                MAP_PRIVATE | MAP_ANON,
+                -1,
+                0,
+            );
+            if ptr as isize == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            let buffer = std::slice::from_raw_parts_mut(ptr as *mut u8, CODE_SIZE);
+            buffer[0] = 0x48;
+            buffer[1] = 0xB8;
+            buffer[2..10].copy_from_slice(&constant.to_le_bytes());
+            buffer[10] = 0x48;
+            buffer[11] = 0x39;
+            buffer[12] = 0xF8;
+            buffer[13] = 0x0F;
+            buffer[14] = 0x94;
+            buffer[15] = 0xC0;
+            buffer[16] = 0x0F;
+            buffer[17] = 0xB6;
+            buffer[18] = 0xC0;
+            buffer[19] = 0xC3;
+            let func = std::mem::transmute(ptr);
+            Ok(Self {
+                ptr,
+                len: CODE_SIZE,
+                func,
+            })
+        }
+    }
+
+    fn evaluate(&self, value: i64) -> bool {
+        unsafe { (self.func)(value) != 0 }
+    }
+}
+
+const PROT_READ: c_int = 0x1;
+const PROT_WRITE: c_int = 0x2;
+const PROT_EXEC: c_int = 0x4;
+const MAP_PRIVATE: c_int = 0x02;
+const MAP_ANON: c_int = 0x20;
+
+extern "C" {
+    fn mmap(
+        addr: *mut c_void,
+        length: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        offset: isize,
+    ) -> *mut c_void;
+
+    fn munmap(addr: *mut c_void, length: usize) -> c_int;
 }
 
 #[derive(Debug, Default)]
@@ -201,6 +794,8 @@ struct PartitioningInfo {
 pub struct SqlDatabase {
     tables: HashMap<String, Table>,
     graphs: HashMap<String, Graph>,
+    optimizer: RefCell<CostBasedOptimizer>,
+    jit_compiler: RefCell<JitCompiler>,
 }
 
 #[derive(Debug, Error)]
@@ -244,6 +839,8 @@ impl SqlDatabase {
         Self {
             tables: HashMap::new(),
             graphs: HashMap::new(),
+            optimizer: RefCell::new(CostBasedOptimizer::default()),
+            jit_compiler: RefCell::new(JitCompiler::default()),
         }
     }
 
@@ -380,6 +977,7 @@ impl SqlDatabase {
             }
             let row_index = table.rows.len();
             table.rows.push(new_row);
+            table.statistics.update_row(&table.rows[row_index]);
             if let Some(partitioning) = &table.partitioning {
                 if let Some(value) = table.rows[row_index].get(partitioning.column_index) {
                     if let Some(key) = partitioning.partition_key(value) {
@@ -409,6 +1007,7 @@ impl SqlDatabase {
     ) -> Result<QueryResult, SqlDatabaseError> {
         if let Some(table) = cte_tables.get(&select.table) {
             self.exec_select_from_table(
+                None,
                 table,
                 &select.columns,
                 select.predicate.as_ref(),
@@ -420,6 +1019,7 @@ impl SqlDatabase {
                 .get(&select.table)
                 .ok_or_else(|| SqlDatabaseError::UnknownTable(select.table.clone()))?;
             self.exec_select_from_table(
+                Some(&select.table),
                 table,
                 &select.columns,
                 select.predicate.as_ref(),
@@ -430,12 +1030,13 @@ impl SqlDatabase {
 
     fn exec_select_from_table(
         &self,
+        table_name: Option<&str>,
         table: &Table,
         columns: &SelectColumns,
         predicate: Option<&Predicate>,
         cte_tables: &HashMap<String, Table>,
     ) -> Result<QueryResult, SqlDatabaseError> {
-        let mut candidate_indices: Option<Vec<usize>> = None;
+        let mut candidates = Vec::new();
         if let Some(predicate) = predicate {
             if let Some(partitioning) = &table.partitioning {
                 if partitioning.matches_column(predicate.column_name()) {
@@ -445,13 +1046,17 @@ impl SqlDatabase {
                             let column_type = table.columns[idx].ty;
                             let coerced = coerce_static_value(value, column_type)?;
                             if let Some(key) = partitioning.partition_key(&coerced) {
-                                if let Some(part_rows) = table.partitions.get(&key) {
-                                    candidate_indices = Some(part_rows.clone());
+                                if let Some(rows) = table.partitions.get(&key) {
+                                    candidates.push(PlanCandidate::new(
+                                        ScanStrategy::PartitionPruned,
+                                        rows.clone(),
+                                    ));
                                 } else {
-                                    candidate_indices = Some(Vec::new());
+                                    candidates.push(PlanCandidate::new(
+                                        ScanStrategy::PartitionPruned,
+                                        Vec::new(),
+                                    ));
                                 }
-                            } else {
-                                candidate_indices = Some(Vec::new());
                             }
                         }
                         Predicate::Between { start, end, .. } => {
@@ -476,31 +1081,29 @@ impl SqlDatabase {
                                 {
                                     indices.extend(rows.iter().copied());
                                 }
-                                candidate_indices = Some(indices);
-                            } else {
-                                candidate_indices = Some(Vec::new());
+                                candidates.push(PlanCandidate::new(
+                                    ScanStrategy::PartitionPruned,
+                                    indices,
+                                ));
                             }
                         }
-                        Predicate::IsNull { .. }
-                        | Predicate::InTableColumn { .. }
-                        | Predicate::FullText { .. } => {}
+                        _ => {}
                     }
                 }
             }
-        }
-        if candidate_indices.is_none() {
-            if let Some(Predicate::Equals { column, value }) = predicate {
+
+            if let Predicate::Equals { column, value } = predicate {
                 let idx = column_index_in_table(table, column)?;
                 match table.columns[idx].ty {
                     ColumnType::Json => {
                         if let Some(index) = table.json_indexes.get(&idx) {
                             let coerced = coerce_static_value(value, ColumnType::Json)?;
                             if let Value::Json(json) = coerced {
-                                let key = canonical_json(&json);
-                                if let Some(rows) = index.map.get(&key) {
-                                    candidate_indices = Some(rows.clone());
-                                } else {
-                                    candidate_indices = Some(Vec::new());
+                                if let Some(rows) = index.map.get(&canonical_json(&json)) {
+                                    candidates.push(PlanCandidate::new(
+                                        ScanStrategy::JsonIndex,
+                                        rows.clone(),
+                                    ));
                                 }
                             }
                         }
@@ -509,11 +1112,11 @@ impl SqlDatabase {
                         if let Some(index) = table.jsonb_indexes.get(&idx) {
                             let coerced = coerce_static_value(value, ColumnType::Jsonb)?;
                             if let Value::Jsonb(json) = coerced {
-                                let key = canonical_json(&json);
-                                if let Some(rows) = index.map.get(&key) {
-                                    candidate_indices = Some(rows.clone());
-                                } else {
-                                    candidate_indices = Some(Vec::new());
+                                if let Some(rows) = index.map.get(&canonical_json(&json)) {
+                                    candidates.push(PlanCandidate::new(
+                                        ScanStrategy::JsonbIndex,
+                                        rows.clone(),
+                                    ));
                                 }
                             }
                         }
@@ -524,12 +1127,11 @@ impl SqlDatabase {
                             if let Value::Xml(xml) = coerced {
                                 if let Some(root) = xml_root_name(&xml) {
                                     if let Some(rows) = index.map.get(&root) {
-                                        candidate_indices = Some(rows.clone());
-                                    } else {
-                                        candidate_indices = Some(Vec::new());
+                                        candidates.push(PlanCandidate::new(
+                                            ScanStrategy::XmlIndex,
+                                            rows.clone(),
+                                        ));
                                     }
-                                } else {
-                                    candidate_indices = Some(Vec::new());
                                 }
                             }
                         }
@@ -543,9 +1145,8 @@ impl SqlDatabase {
                                 for item in index.tree.locate_in_envelope_intersecting(&envelope) {
                                     rows.push(item.row);
                                 }
-                                rows.sort_unstable();
-                                rows.dedup();
-                                candidate_indices = Some(rows);
+                                candidates
+                                    .push(PlanCandidate::new(ScanStrategy::SpatialIndex, rows));
                             }
                         }
                     }
@@ -554,20 +1155,52 @@ impl SqlDatabase {
             }
         }
 
-        let iter: Box<dyn Iterator<Item = usize>> = match candidate_indices {
-            Some(indices) => Box::new(indices.into_iter()),
-            None => Box::new(0..table.rows.len()),
+        let (plan, mut strategy, estimated_cardinality) =
+            self.optimizer
+                .borrow_mut()
+                .choose_plan(table_name, table, predicate, &candidates);
+
+        let jit_context = if let Some(predicate) = predicate {
+            self.maybe_compile_predicate(table_name, table, predicate)?
+        } else {
+            None
         };
 
-        let mut matching_indices = Vec::new();
-        for row_index in iter {
-            let row = &table.rows[row_index];
-            if let Some(predicate) = predicate {
-                if !self.evaluate_predicate(table, predicate, row, cte_tables)? {
-                    continue;
-                }
-            }
-            matching_indices.push(row_index);
+        let (mut matching_indices, mut scanned, switched, processed) = self
+            .execute_plan_vectorized(
+                table,
+                &plan,
+                predicate,
+                cte_tables,
+                jit_context.as_ref(),
+                estimated_cardinality,
+                strategy,
+            )?;
+
+        if switched {
+            let (mut fallback, fallback_scanned) = self.execute_fallback_sequential(
+                table,
+                predicate,
+                cte_tables,
+                jit_context.as_ref(),
+                &processed,
+            )?;
+            scanned += fallback_scanned;
+            matching_indices.append(&mut fallback);
+            strategy = ScanStrategy::Sequential;
+        }
+
+        let mut seen = HashSet::new();
+        matching_indices.retain(|idx| seen.insert(*idx));
+
+        if let (Some(name), Some(predicate)) = (table_name, predicate) {
+            self.optimizer.borrow_mut().record_feedback(
+                name,
+                predicate,
+                scanned,
+                matching_indices.len(),
+                strategy,
+            );
         }
 
         match columns {
@@ -644,6 +1277,195 @@ impl SqlDatabase {
                 Ok(QueryResult::Rows { columns, rows })
             }
         }
+    }
+
+    fn maybe_compile_predicate(
+        &self,
+        table_name: Option<&str>,
+        table: &Table,
+        predicate: &Predicate,
+    ) -> Result<Option<JitContext>, SqlDatabaseError> {
+        let Some(name) = table_name else {
+            return Ok(None);
+        };
+        if let Predicate::Equals { column, value } = predicate {
+            let idx = self.column_index(table, column)?;
+            if table.columns[idx].ty != ColumnType::Integer {
+                return Ok(None);
+            }
+            let coerced = coerce_static_value(value, ColumnType::Integer)?;
+            if let Value::Integer(int_value) = coerced {
+                let key = format!("{}::{}", name.to_ascii_lowercase(), predicate.signature());
+                if let Some(compiled) = self
+                    .jit_compiler
+                    .borrow_mut()
+                    .get_or_compile(&key, int_value)
+                {
+                    return Ok(Some(JitContext {
+                        column_index: idx,
+                        compiled,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn execute_plan_vectorized(
+        &self,
+        table: &Table,
+        plan: &ScanPlan,
+        predicate: Option<&Predicate>,
+        cte_tables: &HashMap<String, Table>,
+        jit_context: Option<&JitContext>,
+        estimated_cardinality: Option<f64>,
+        strategy: ScanStrategy,
+    ) -> Result<(Vec<usize>, usize, bool, HashSet<usize>), SqlDatabaseError> {
+        const CHUNK: usize = 64;
+        let mut matches = Vec::new();
+        let mut scanned = 0usize;
+        let mut processed = HashSet::new();
+        let mut should_switch = false;
+
+        match plan {
+            ScanPlan::Sequential => {
+                let mut buffer = Vec::with_capacity(CHUNK);
+                for idx in 0..table.rows.len() {
+                    buffer.push(idx);
+                    if buffer.len() == CHUNK {
+                        self.evaluate_chunk(
+                            table,
+                            &buffer,
+                            predicate,
+                            cte_tables,
+                            jit_context,
+                            &mut matches,
+                        )?;
+                        scanned += buffer.len();
+                        buffer.clear();
+                    }
+                }
+                if !buffer.is_empty() {
+                    self.evaluate_chunk(
+                        table,
+                        &buffer,
+                        predicate,
+                        cte_tables,
+                        jit_context,
+                        &mut matches,
+                    )?;
+                    scanned += buffer.len();
+                }
+            }
+            ScanPlan::Index(indices) => {
+                for chunk in indices.chunks(CHUNK) {
+                    self.evaluate_chunk(
+                        table,
+                        chunk,
+                        predicate,
+                        cte_tables,
+                        jit_context,
+                        &mut matches,
+                    )?;
+                    for &row_index in chunk {
+                        processed.insert(row_index);
+                    }
+                    scanned += chunk.len();
+                    if strategy != ScanStrategy::Sequential {
+                        if let Some(estimate) = estimated_cardinality {
+                            if estimate > 0.0 && (scanned as f64) > estimate * 4.0 {
+                                should_switch = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((matches, scanned, should_switch, processed))
+    }
+
+    fn execute_fallback_sequential(
+        &self,
+        table: &Table,
+        predicate: Option<&Predicate>,
+        cte_tables: &HashMap<String, Table>,
+        jit_context: Option<&JitContext>,
+        processed: &HashSet<usize>,
+    ) -> Result<(Vec<usize>, usize), SqlDatabaseError> {
+        const CHUNK: usize = 64;
+        let mut buffer = Vec::with_capacity(CHUNK);
+        let mut matches = Vec::new();
+        let mut scanned = 0usize;
+        for idx in 0..table.rows.len() {
+            if processed.contains(&idx) {
+                continue;
+            }
+            buffer.push(idx);
+            if buffer.len() == CHUNK {
+                self.evaluate_chunk(
+                    table,
+                    &buffer,
+                    predicate,
+                    cte_tables,
+                    jit_context,
+                    &mut matches,
+                )?;
+                scanned += buffer.len();
+                buffer.clear();
+            }
+        }
+        if !buffer.is_empty() {
+            self.evaluate_chunk(
+                table,
+                &buffer,
+                predicate,
+                cte_tables,
+                jit_context,
+                &mut matches,
+            )?;
+            scanned += buffer.len();
+        }
+        Ok((matches, scanned))
+    }
+
+    fn evaluate_chunk(
+        &self,
+        table: &Table,
+        chunk: &[usize],
+        predicate: Option<&Predicate>,
+        cte_tables: &HashMap<String, Table>,
+        jit_context: Option<&JitContext>,
+        output: &mut Vec<usize>,
+    ) -> Result<(), SqlDatabaseError> {
+        if let (Some(jit), Some(pred @ Predicate::Equals { .. })) = (jit_context, predicate) {
+            for &row_index in chunk {
+                let row = &table.rows[row_index];
+                let matches = match &row[jit.column_index] {
+                    Value::Integer(value) => jit.compiled.evaluate(*value),
+                    Value::Null => false,
+                    _ => self.evaluate_predicate(table, pred, row, cte_tables)?,
+                };
+                if matches {
+                    output.push(row_index);
+                }
+            }
+            return Ok(());
+        }
+
+        for &row_index in chunk {
+            let row = &table.rows[row_index];
+            let matches = if let Some(predicate) = predicate {
+                self.evaluate_predicate(table, predicate, row, cte_tables)?
+            } else {
+                true
+            };
+            if matches {
+                output.push(row_index);
+            }
+        }
+        Ok(())
     }
 
     fn materialize_ctes(
@@ -726,23 +1548,19 @@ impl SqlDatabase {
         let cte_tables = self.materialize_ctes(&ctes)?;
 
         let source_table = if let Some(table) = cte_tables.get(&merge.source.name) {
-            Table {
-                columns: table.columns.clone(),
-                rows: table.rows.clone(),
-                partitioning: None,
-                partitions: BTreeMap::new(),
-            }
+            let mut clone = table.clone();
+            clone.partitioning = None;
+            clone.partitions = BTreeMap::new();
+            clone
         } else {
             let table = self
                 .tables
                 .get(&merge.source.name)
                 .ok_or_else(|| SqlDatabaseError::UnknownTable(merge.source.name.clone()))?;
-            Table {
-                columns: table.columns.clone(),
-                rows: table.rows.clone(),
-                partitioning: None,
-                partitions: BTreeMap::new(),
-            }
+            let mut clone = table.clone();
+            clone.partitioning = None;
+            clone.partitions = BTreeMap::new();
+            clone
         };
 
         let target_name = merge.target.name.clone();
@@ -1333,6 +2151,48 @@ impl Predicate {
             Predicate::IsNull { column } => column,
             Predicate::InTableColumn { column, .. } => column,
             Predicate::FullText { column, .. } => column,
+        }
+    }
+
+    fn signature(&self) -> String {
+        match self {
+            Predicate::Equals { column, value } => format!(
+                "eq:{}:{}",
+                column.to_ascii_lowercase(),
+                statistics_key(value)
+            ),
+            Predicate::Between { column, start, end } => format!(
+                "between:{}:{}:{}",
+                column.to_ascii_lowercase(),
+                statistics_key(start),
+                statistics_key(end)
+            ),
+            Predicate::IsNull { column } => {
+                format!("isnull:{}", column.to_ascii_lowercase())
+            }
+            Predicate::InTableColumn {
+                column,
+                table,
+                table_column,
+            } => format!(
+                "in:{}:{}:{}",
+                column.to_ascii_lowercase(),
+                table.to_ascii_lowercase(),
+                table_column.to_ascii_lowercase()
+            ),
+            Predicate::FullText {
+                column,
+                query,
+                language,
+            } => format!(
+                "fulltext:{}:{}:{}",
+                column.to_ascii_lowercase(),
+                query.to_ascii_lowercase(),
+                language
+                    .as_ref()
+                    .map(|lang| lang.to_ascii_lowercase())
+                    .unwrap_or_default()
+            ),
         }
     }
 }
@@ -2267,6 +3127,8 @@ fn initialize_secondary_indexes(table: &mut Table) {
             _ => {}
         }
     }
+    let column_types: Vec<ColumnType> = table.columns.iter().map(|c| c.ty).collect();
+    table.statistics.initialize(&column_types);
 }
 
 fn rebuild_secondary_indexes(table: &mut Table) {
@@ -2285,6 +3147,7 @@ fn rebuild_secondary_indexes(table: &mut Table) {
     for row_index in 0..table.rows.len() {
         update_indexes_for_row(table, row_index);
     }
+    table.statistics.recompute(&table.rows);
 }
 
 fn update_indexes_for_row(table: &mut Table, row_index: usize) {
