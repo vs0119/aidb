@@ -10,7 +10,7 @@ use thiserror::Error;
 
 mod planner;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum Value {
     Integer(i64),
     Float(f64),
@@ -95,7 +95,7 @@ impl Table {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum Geometry {
     Point {
         x: f64,
@@ -224,6 +224,7 @@ struct PartitioningInfo {
 
 const TABLE_STATS_TABLE: &str = "__aidb_table_stats";
 const COLUMN_STATS_TABLE: &str = "__aidb_column_stats";
+const DEFAULT_HISTOGRAM_BUCKETS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableStatistics {
@@ -242,8 +243,21 @@ pub struct ColumnStatistics {
     pub distinct_count: u64,
     pub min: Option<Value>,
     pub max: Option<Value>,
+    pub histogram: Option<ColumnHistogram>,
     pub analyzed_at: DateTime<Utc>,
     pub stats_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnHistogram {
+    pub buckets: Vec<HistogramBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramBucket {
+    pub lower: f64,
+    pub upper: f64,
+    pub count: u64,
 }
 
 #[derive(Debug)]
@@ -459,6 +473,7 @@ impl SqlDatabase {
                 self.exec_analyze(table)?;
                 Ok(QueryResult::None)
             }
+            Statement::ShowTables => self.exec_show_tables(),
             Statement::MatchGraph {
                 graph,
                 from,
@@ -623,6 +638,28 @@ impl SqlDatabase {
         Ok(())
     }
 
+    fn exec_show_tables(&self) -> Result<QueryResult, SqlDatabaseError> {
+        let mut rows = Vec::new();
+        for (table_name, table) in &self.tables {
+            let row = vec![
+                Value::Text(table_name.clone()),
+                Value::Integer(table.rows.len() as i64),
+                Value::Null, // created_at - not available
+                Value::Null, // size - not available
+            ];
+            rows.push(row);
+        }
+
+        let columns = vec![
+            "name".to_string(),
+            "row_count".to_string(),
+            "created_at".to_string(),
+            "size".to_string(),
+        ];
+
+        Ok(QueryResult::Rows { columns, rows })
+    }
+
     fn exec_select(
         &self,
         ctes: Vec<CommonTableExpression>,
@@ -685,7 +722,9 @@ impl SqlDatabase {
         predicate: Option<&Predicate>,
         cte_tables: &HashMap<String, Table>,
     ) -> Result<QueryResult, SqlDatabaseError> {
-        let context = planner::PlanContext::new(table_ref);
+        let table_stats = self.get_table_statistics(table_ref.name);
+        let column_stats = self.column_statistics(table_ref.name);
+        let context = planner::PlanContext::new(table_ref, table_stats, column_stats);
         let mut builder = planner::LogicalPlanBuilder::scan(table_ref);
         if let Some(pred) = predicate.cloned() {
             builder = builder.filter(pred);
@@ -1411,6 +1450,7 @@ enum Statement {
     Analyze {
         table: Option<String>,
     },
+    ShowTables,
     MatchGraph {
         graph: String,
         from: Option<String>,
@@ -1561,6 +1601,8 @@ fn parse_statement(sql: &str) -> Result<Statement, SqlDatabaseError> {
         })
     } else if let Some(rest) = strip_keyword_ci(trimmed, "ANALYZE") {
         parse_analyze(rest)
+    } else if let Some(rest) = strip_keyword_ci(trimmed, "SHOW") {
+        parse_show(rest)
     } else if let Some(rest) = strip_keyword_ci(trimmed, "MATCH") {
         let rest = expect_keyword_ci(rest, "GRAPH")?;
         parse_match_graph(rest)
@@ -1682,6 +1724,16 @@ fn parse_analyze(input: &str) -> Result<Statement, SqlDatabaseError> {
     let (table, rest) = parse_identifier(trimmed)?;
     ensure_no_trailing_tokens(rest)?;
     Ok(Statement::Analyze { table: Some(table) })
+}
+
+fn parse_show(input: &str) -> Result<Statement, SqlDatabaseError> {
+    let trimmed = input.trim();
+    if let Some(rest) = strip_keyword_ci(trimmed, "TABLES") {
+        ensure_no_trailing_tokens(rest)?;
+        Ok(Statement::ShowTables)
+    } else {
+        Err(SqlDatabaseError::Parse("unsupported SHOW statement".into()))
+    }
 }
 
 fn parse_literal_token(input: &str) -> Result<(Value, &str), SqlDatabaseError> {
@@ -2541,6 +2593,62 @@ fn update_min_max(
     }
 }
 
+fn stats_numeric_value(column_type: ColumnType, value: &Value) -> Option<f64> {
+    match column_type {
+        ColumnType::Integer => match value {
+            Value::Integer(v) => Some(*v as f64),
+            Value::Float(v) => Some(*v),
+            _ => None,
+        },
+        ColumnType::Float => match value {
+            Value::Float(v) => Some(*v),
+            Value::Integer(v) => Some(*v as f64),
+            _ => None,
+        },
+        ColumnType::Timestamp => match value {
+            Value::Timestamp(ts) => Some(ts.timestamp_millis() as f64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn build_histogram_from_numeric(values: &mut Vec<f64>) -> Option<ColumnHistogram> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let len = values.len();
+    let bucket_count = DEFAULT_HISTOGRAM_BUCKETS.min(len);
+    if bucket_count == 0 {
+        return None;
+    }
+    let mut buckets = Vec::with_capacity(bucket_count);
+    for bucket_idx in 0..bucket_count {
+        let start = (bucket_idx * len) / bucket_count;
+        let mut end = ((bucket_idx + 1) * len) / bucket_count;
+        if end == start {
+            end = (start + 1).min(len);
+        }
+        let slice = &values[start..end];
+        if slice.is_empty() {
+            continue;
+        }
+        let lower = slice.first().copied().unwrap_or(0.0);
+        let upper = slice.last().copied().unwrap_or(lower);
+        buckets.push(HistogramBucket {
+            lower,
+            upper,
+            count: slice.len() as u64,
+        });
+    }
+    if buckets.is_empty() {
+        None
+    } else {
+        Some(ColumnHistogram { buckets })
+    }
+}
+
 fn compute_column_statistics(
     table_name: &str,
     column: &Column,
@@ -2553,6 +2661,7 @@ fn compute_column_statistics(
     let mut distinct_values: HashSet<String> = HashSet::new();
     let mut min_value: Option<Value> = None;
     let mut max_value: Option<Value> = None;
+    let mut numeric_values: Vec<f64> = Vec::new();
 
     for row in rows {
         if let Some(value) = row.get(column_index) {
@@ -2564,8 +2673,13 @@ fn compute_column_statistics(
                 distinct_values.insert(key);
             }
             update_min_max(column.ty, &mut min_value, &mut max_value, value);
+            if let Some(num) = stats_numeric_value(column.ty, value) {
+                numeric_values.push(num);
+            }
         }
     }
+
+    let histogram = build_histogram_from_numeric(&mut numeric_values);
 
     ColumnStatistics {
         table_name: table_name.to_string(),
@@ -2575,6 +2689,7 @@ fn compute_column_statistics(
         distinct_count: distinct_values.len() as u64,
         min: min_value,
         max: max_value,
+        histogram,
         analyzed_at,
         stats_version,
     }
@@ -3700,8 +3815,8 @@ fn timestamp_from_float(value: f64) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::planner::{
-        LogicalExpr, LogicalPlanBuilder, PlanContext, Planner, ResolvedTable, ScanCandidates,
-        TableSource,
+        CardinalityEstimator, CostModel, JoinPredicate, LogicalExpr, LogicalPlanBuilder,
+        PlanContext, Planner, ResolvedTable, ScanCandidates, TableSource,
     };
     use super::*;
     use serde_json::json;
@@ -4323,6 +4438,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn join_cardinality_estimator_matches_observed() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE customers (id INT, region TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (id INT, customer_id INT, total FLOAT);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO customers VALUES (1, 'north'), (2, 'south'), (3, 'north'), (4, 'west'), (5, 'south');",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO orders VALUES \
+            (10, 1, 120.5), (11, 1, 80.0), (12, 2, 55.0), (13, 2, 75.0), (14, 2, 110.0), (15, 3, 20.0),\
+            (16, 4, 42.0), (17, NULL, 15.0), (18, 6, 9.5);",
+        )
+        .unwrap();
+        db.execute("ANALYZE customers;").unwrap();
+        db.execute("ANALYZE orders;").unwrap();
+
+        let customers_ctx = plan_context_for_table(&db, "customers");
+        let orders_ctx = plan_context_for_table(&db, "orders");
+        let predicate = JoinPredicate::inner("id", "customer_id");
+        let estimate = CardinalityEstimator::estimate_join(&customers_ctx, &orders_ctx, &predicate);
+
+        let actual = actual_join_cardinality(
+            db.tables.get("customers").unwrap(),
+            "id",
+            db.tables.get("orders").unwrap(),
+            "customer_id",
+        ) as f64;
+
+        let tolerance = actual.max(1.0) * 0.25;
+        let diff = (estimate.estimated_rows - actual).abs();
+        assert!(
+            diff <= tolerance,
+            "join cardinality estimate {estimate:?} diverges from observed {actual} (diff {diff})",
+        );
+        assert!(
+            estimate.confidence >= 0.7,
+            "expected high confidence, got {}",
+            estimate.confidence
+        );
+    }
+
+    #[test]
+    fn join_estimator_handles_missing_statistics() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE inventory (sku INT, qty INT);")
+            .unwrap();
+        db.execute("CREATE TABLE shipments (sku INT, shipped INT);")
+            .unwrap();
+        db.execute("INSERT INTO inventory VALUES (100, 20), (101, 15), (102, 5), (103, 12);")
+            .unwrap();
+        db.execute("INSERT INTO shipments VALUES (100, 3), (101, 7), (101, 4), (105, 9);")
+            .unwrap();
+
+        let inventory_ctx = plan_context_for_table(&db, "inventory");
+        let shipments_ctx = plan_context_for_table(&db, "shipments");
+        let predicate = JoinPredicate::inner("sku", "sku");
+        let estimate =
+            CardinalityEstimator::estimate_join(&inventory_ctx, &shipments_ctx, &predicate);
+
+        assert!(
+            estimate.estimated_rows > 0.0,
+            "fallback estimation should be positive"
+        );
+        assert!(
+            estimate.confidence <= 0.5,
+            "fallback estimation should reflect low confidence, got {}",
+            estimate.confidence
+        );
+    }
+
+    #[test]
+    fn cost_model_uses_cardinality_estimates() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE authors (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE books (id INT, author_id INT, title TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO authors VALUES (1, 'Ada'), (2, 'Grace'), (3, 'Edsger');")
+            .unwrap();
+        db.execute(
+            "INSERT INTO books VALUES (10, 1, 'Programming'), (11, 1, 'Algorithms'), \
+             (12, 2, 'Compilers'), (13, 2, 'COBOL'), (14, 2, 'Computing Machinery'), (15, 4, 'Ghost');",
+        )
+        .unwrap();
+        db.execute("ANALYZE authors;").unwrap();
+        db.execute("ANALYZE books;").unwrap();
+
+        let authors_ctx = plan_context_for_table(&db, "authors");
+        let books_ctx = plan_context_for_table(&db, "books");
+        let predicate = Predicate::Equals {
+            column: "author_id".into(),
+            value: Value::Integer(2),
+        };
+        let cost_model = CostModel::new(8192.0, 1.0);
+        let scan_cost = cost_model.estimate_scan(&books_ctx, Some(&predicate));
+        assert!(scan_cost.cardinality.estimated_rows > 0.0);
+
+        let join_predicate = JoinPredicate::inner("id", "author_id");
+        let join_cost = cost_model.estimate_join(&authors_ctx, &books_ctx, &join_predicate);
+        assert!(
+            join_cost.cardinality.estimated_rows >= scan_cost.cardinality.estimated_rows,
+            "join cardinality should dominate scan"
+        );
+        assert!(
+            join_cost.cpu_cost > scan_cost.cpu_cost,
+            "join CPU cost should exceed filtered scan cost"
+        );
+        assert!(
+            join_cost.total_cost() > 0.0,
+            "total cost should be positive"
+        );
+    }
+
     fn optimized_plan_for<'a>(
         db: &'a SqlDatabase,
         table_name: &'a str,
@@ -4334,7 +4566,9 @@ mod tests {
             .get(table_name)
             .unwrap_or_else(|| panic!("table {table_name} not found"));
         let resolved = ResolvedTable::new(table_name, TableSource::Base, table);
-        let context = PlanContext::new(resolved);
+        let table_stats = db.get_table_statistics(table_name);
+        let column_stats = db.column_statistics(table_name);
+        let context = PlanContext::new(resolved, table_stats, column_stats);
         let mut builder = LogicalPlanBuilder::scan(resolved);
         if let Some(pred) = predicate {
             builder = builder.filter(pred);
@@ -4343,6 +4577,52 @@ mod tests {
         Planner::new(context)
             .optimize(plan)
             .expect("plan optimization should succeed")
+    }
+
+    fn plan_context_for_table<'a>(db: &'a SqlDatabase, table_name: &'a str) -> PlanContext<'a> {
+        let table = db
+            .tables
+            .get(table_name)
+            .unwrap_or_else(|| panic!("table {table_name} not found"));
+        let resolved = ResolvedTable::new(table_name, TableSource::Base, table);
+        let table_stats = db.get_table_statistics(table_name);
+        let column_stats = db.column_statistics(table_name);
+        PlanContext::new(resolved, table_stats, column_stats)
+    }
+
+    fn actual_join_cardinality(
+        left: &super::Table,
+        left_column: &str,
+        right: &super::Table,
+        right_column: &str,
+    ) -> usize {
+        let left_idx = left
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(left_column))
+            .expect("left join column");
+        let right_idx = right
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(right_column))
+            .expect("right join column");
+        let mut count = 0usize;
+        for left_row in &left.rows {
+            let left_value = &left_row[left_idx];
+            if matches!(left_value, Value::Null) {
+                continue;
+            }
+            for right_row in &right.rows {
+                let right_value = &right_row[right_idx];
+                if matches!(right_value, Value::Null) {
+                    continue;
+                }
+                if left_value == right_value {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     fn plan_components<'a>(

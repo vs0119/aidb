@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aidb_core::{Id, JsonValue, MetadataFilter, Metric, Vector};
 use aidb_index_bf::BruteForceIndex;
 use aidb_index_hnsw::{HnswIndex, HnswParams};
-use aidb_storage::{Collection, Engine};
+use aidb_sql::{QueryResult as SqlQueryResult, SqlDatabase, Value as SqlValue};
+use aidb_storage::{
+    Collection, Engine, InMemoryStatisticsCatalog, StatisticsCatalog, StatsRefreshScheduler
+};
 use axum::{
     extract::Path,
     extract::State,
@@ -68,6 +71,9 @@ impl aidb_core::VectorIndex for AnyIndex {
 #[derive(Clone)]
 struct AppState {
     engine: Arc<Engine<AnyIndex>>,
+    sql_db: Arc<Mutex<SqlDatabase>>,
+    stats_catalog: Arc<dyn StatisticsCatalog>,
+    stats_scheduler: Arc<StatsRefreshScheduler>,
 }
 
 fn format_system_time(ts: std::time::SystemTime) -> Option<String> {
@@ -119,10 +125,46 @@ struct CreateCollectionResp {
     ok: bool,
 }
 
+// Statistics API types
+#[derive(Serialize)]
+struct StatisticsSummary {
+    total_tables: i32,
+    analyzed_tables: i32,
+    total_columns: i32,
+    analyzed_columns: i32,
+    active_refresh_jobs: i32,
+}
+
+#[derive(Serialize)]
+struct TableStatistics {
+    table_name: String,
+    row_count: u64,
+    analyzed_at: String,
+    stats_version: u32,
+}
+
+#[derive(Serialize)]
+struct ColumnStatistics {
+    table_name: String,
+    column_name: String,
+    null_count: Option<u64>,
+    distinct_count: Option<u64>,
+    min: Option<String>,
+    max: Option<String>,
+    analyzed_at: String,
+    stats_version: u32,
+}
+
+#[derive(Deserialize)]
+struct AnalyzeRequest {
+    table: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let engine = Arc::new(Engine::<AnyIndex>::new());
+    let sql_db = Arc::new(Mutex::new(SqlDatabase::new()));
 
     let app = Router::new()
         .route("/health", get(health))
@@ -136,12 +178,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/collections/:name/search", post(search_points))
         .route("/collections/:name/search:batch", post(search_points_batch))
         .route("/sql", post(exec_sql))
+        .route("/sql/tables", post(exec_table_sql))
         .route("/collections/:name", get(collection_info))
         .route("/collections/:name/snapshot", post(snapshot_collection))
         .route("/collections/:name/compact", post(compact_collection))
         .route("/collections/:name/params", post(update_params))
         .route("/collections/:name/points/:id", delete(delete_point))
-        .with_state(AppState { engine });
+        .route("/statistics/summary", get(get_statistics_summary))
+        .route("/statistics/tables", get(get_table_statistics))
+        .route("/statistics/columns", get(get_column_statistics))
+        .route("/statistics/analyze", post(analyze_statistics))
+        .with_state(AppState {
+            engine,
+            sql_db,
+            stats_catalog: Arc::new(InMemoryStatisticsCatalog::new()),
+            stats_scheduler: Arc::new(StatsRefreshScheduler::new()),
+        });
 
     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
     println!("aidb-server listening on {addr}");
@@ -538,6 +590,28 @@ enum SqlResp {
     },
 }
 
+// SQL Table structures
+#[derive(Deserialize)]
+struct SqlTableReq {
+    query: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SqlTableResp {
+    None,
+    Inserted {
+        count: usize,
+    },
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<SqlValue>>,
+    },
+    Error {
+        message: String,
+    },
+}
+
 async fn exec_sql(
     State(state): State<AppState>,
     Json(req): Json<SqlReq>,
@@ -579,6 +653,120 @@ async fn exec_sql(
     }
 }
 
+async fn exec_table_sql(
+    State(state): State<AppState>,
+    Json(req): Json<SqlTableReq>,
+) -> Result<Json<SqlTableResp>, (StatusCode, String)> {
+    let mut sql_db = state.sql_db.lock().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database lock error: {}", e),
+        )
+    })?;
+
+    match sql_db.execute(&req.query) {
+        Ok(result) => {
+            let response = match result {
+                SqlQueryResult::None => SqlTableResp::None,
+                SqlQueryResult::Inserted(count) => SqlTableResp::Inserted { count },
+                SqlQueryResult::Rows { columns, rows } => SqlTableResp::Rows { columns, rows },
+            };
+            Ok(Json(response))
+        }
+        Err(e) => Ok(Json(SqlTableResp::Error {
+            message: e.to_string(),
+        })),
+    }
+}
+
+// Statistics endpoints
+
+async fn get_statistics_summary(
+    State(state): State<AppState>,
+) -> Result<Json<StatisticsSummary>, (StatusCode, String)> {
+    let mut sql_db = state.sql_db.lock().unwrap();
+
+    // Get total tables using SHOW TABLES
+    let total_tables = match sql_db.execute("SHOW TABLES") {
+        Ok(SqlQueryResult::Rows { rows, .. }) => rows.len() as i32,
+        _ => 0,
+    };
+
+    // Get analyzed tables from statistics catalog
+    let all_table_stats = sql_db.table_statistics();
+    let analyzed_tables = all_table_stats.len() as i32;
+
+    // Get all column statistics
+    let all_column_stats = sql_db.all_column_statistics();
+    let analyzed_columns = all_column_stats.len() as i32;
+
+    // For total columns, we'd need to iterate through each table and describe it
+    // For now, use a simple estimate
+    let total_columns = analyzed_columns.max(total_tables * 3); // Estimate 3 columns per table
+
+    Ok(Json(StatisticsSummary {
+        total_tables,
+        analyzed_tables,
+        total_columns,
+        analyzed_columns,
+        active_refresh_jobs: 0, // TODO: Get from stats_scheduler
+    }))
+}
+
+async fn get_table_statistics(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<TableStatistics>>, (StatusCode, String)> {
+    let sql_db = state.sql_db.lock().unwrap();
+    let stats = sql_db.table_statistics();
+
+    let result = stats.into_iter().map(|stat| TableStatistics {
+        table_name: stat.table_name,
+        row_count: stat.row_count,
+        analyzed_at: stat.analyzed_at.to_rfc3339(),
+        stats_version: stat.stats_version,
+    }).collect();
+
+    Ok(Json(result))
+}
+
+async fn get_column_statistics(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ColumnStatistics>>, (StatusCode, String)> {
+    let sql_db = state.sql_db.lock().unwrap();
+    let stats = sql_db.all_column_statistics();
+
+    let result = stats.into_iter().map(|stat| ColumnStatistics {
+        table_name: stat.table_name,
+        column_name: stat.column_name,
+        null_count: Some(stat.null_count),
+        distinct_count: Some(stat.distinct_count),
+        min: stat.min.map(|v| format!("{:?}", v)),
+        max: stat.max.map(|v| format!("{:?}", v)),
+        analyzed_at: stat.analyzed_at.to_rfc3339(),
+        stats_version: stat.stats_version,
+    }).collect();
+
+    Ok(Json(result))
+}
+
+async fn analyze_statistics(
+    State(state): State<AppState>,
+    Json(req): Json<AnalyzeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut sql_db = state.sql_db.lock().unwrap();
+
+    let query = if let Some(table) = req.table {
+        format!("ANALYZE {}", table)
+    } else {
+        "ANALYZE".to_string()
+    };
+
+    match sql_db.execute(&query) {
+        Ok(_) => Ok(Json(serde_json::json!({"ok": true}))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,7 +790,12 @@ mod tests {
 
         let engine = Arc::new(Engine::<AnyIndex>::new());
         engine.insert_collection(collection);
-        let state = AppState { engine };
+        let state = AppState {
+            engine,
+            sql_db: Arc::new(Mutex::new(SqlDatabase::new())),
+            stats_catalog: Arc::new(InMemoryStatisticsCatalog::new()),
+            stats_scheduler: Arc::new(StatsRefreshScheduler::new()),
+        };
 
         let (status, body) = metrics(State(state)).await.unwrap();
         assert_eq!(status, StatusCode::OK);

@@ -18,16 +18,16 @@ struct RootView: View {
         ZStack(alignment: .top) {
             NavigationSplitView {
                 SidebarView()
+                    .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 400)
             } detail: {
-                if let sel = model.selection {
+                if let selectedTable = model.selectedTable {
+                    TableDataView(table: selectedTable)
+                        .environmentObject(model)
+                } else if let sel = model.selection {
                     CollectionDetailView(collection: sel)
                 } else {
-                    VStack(spacing: 12) {
-                        Text("AIDB Mac UI").font(.largeTitle)
-                        ConnectionView()
-                        if model.healthOK { Text("Server: healthy").foregroundStyle(.green) }
-                    }
-                    .padding()
+                    DashboardView()
+                        .environmentObject(model)
                 }
             }
             if let message = model.errorMessage {

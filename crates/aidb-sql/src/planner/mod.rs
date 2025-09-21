@@ -1,11 +1,18 @@
+mod cardinality;
 mod context;
+mod cost;
 mod heuristics;
 mod logical;
 mod memo;
 mod rules;
 mod table_ref;
 
-pub use context::PlanContext;
+#[allow(unused_imports)]
+pub use cardinality::{CardinalityEstimate, CardinalityEstimator, JoinPredicate, JoinType};
+#[allow(unused_imports)]
+pub use context::{PlanContext, PlanStatistics};
+#[allow(unused_imports)]
+pub use cost::{CostEstimate, CostModel};
 pub use logical::{LogicalExpr, LogicalPlan, LogicalPlanBuilder};
 pub use table_ref::{ResolvedTable, TableSource};
 
