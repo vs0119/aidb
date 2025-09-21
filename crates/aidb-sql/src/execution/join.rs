@@ -30,7 +30,7 @@ impl TableHandle {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct JoinPartitionOutcome {
     rows: Vec<Vec<Value>>,
     input_rows: usize,
@@ -68,7 +68,7 @@ fn run_hash_partition(
     build_ref: TableHandle,
     probe_ref: TableHandle,
     build_is_left: bool,
-    build_index: usize,
+    _build_index: usize,
     probe_index: usize,
     hash_map: &HashMap<String, Vec<usize>>,
 ) -> JoinPartitionOutcome {
@@ -143,7 +143,7 @@ fn run_nested_partition(
         ScanPartition::Range { start, end } => {
             for probe_idx in *start..*end {
                 let probe_row = &probe_table.rows[probe_idx];
-                for (build_idx, build_row) in build_table.rows.iter().enumerate() {
+                for build_row in &build_table.rows {
                     if equal(&build_row[build_index], &probe_row[probe_index]) {
                         let (left_row, right_row) = if build_is_left {
                             (build_row, probe_row)
@@ -161,7 +161,7 @@ fn run_nested_partition(
         ScanPartition::Indices(indices) => {
             for &probe_idx in indices {
                 let probe_row = &probe_table.rows[probe_idx];
-                for (build_idx, build_row) in build_table.rows.iter().enumerate() {
+                for build_row in &build_table.rows {
                     if equal(&build_row[build_index], &probe_row[probe_index]) {
                         let (left_row, right_row) = if build_is_left {
                             (build_row, probe_row)
@@ -225,7 +225,11 @@ pub(crate) fn parallel_hash_join(
         return Ok(Vec::new());
     }
 
-    let partitions = partition_probe_rows(probe_table.rows.len(), batch_size.max(1));
+    let partitions = partition_scan_candidates(
+        &ScanCandidates::AllRows,
+        probe_table.rows.len(),
+        batch_size.max(1),
+    );
     if partitions.is_empty() {
         return Ok(Vec::new());
     }

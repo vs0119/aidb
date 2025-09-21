@@ -66,6 +66,7 @@ impl<'a> fmt::Debug for FilterExpr<'a> {
 pub struct ScanExpr<'a> {
     pub table: ResolvedTable<'a>,
     pub candidates: ScanCandidates,
+    pub options: ScanOptions,
 }
 
 impl<'a> fmt::Debug for ScanExpr<'a> {
@@ -73,8 +74,14 @@ impl<'a> fmt::Debug for ScanExpr<'a> {
         f.debug_struct("Scan")
             .field("table", &self.table)
             .field("candidates", &self.candidates)
+            .field("options", &self.options)
             .finish()
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ScanOptions {
+    pub pushdown_predicate: Option<Predicate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +112,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         let expr = LogicalExpr::Scan(ScanExpr {
             table,
             candidates: ScanCandidates::AllRows,
+            options: ScanOptions::default(),
         });
         Self { current: expr }
     }

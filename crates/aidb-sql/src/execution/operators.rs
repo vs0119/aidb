@@ -79,6 +79,10 @@ pub(crate) enum BatchPredicate {
         column_index: usize,
         value: Value,
     },
+    GreaterOrEqual {
+        column_index: usize,
+        value: Value,
+    },
     Between {
         column_index: usize,
         low: Value,
@@ -112,6 +116,25 @@ pub(crate) fn apply_predicate(batch: &mut ColumnarBatch<'_>, predicate: &BatchPr
                 .values()
                 .iter()
                 .map(|candidate| equal(candidate, value))
+                .collect()
+        }
+        BatchPredicate::GreaterOrEqual {
+            column_index,
+            value,
+        } => {
+            let column = batch.column(*column_index);
+            column
+                .values()
+                .iter()
+                .map(|candidate| {
+                    if matches!(candidate, Value::Null) {
+                        return false;
+                    }
+                    matches!(
+                        compare_values(candidate, value),
+                        Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
+                    )
+                })
                 .collect()
         }
         BatchPredicate::Between {

@@ -23,7 +23,7 @@ impl<'a> RewriteRule<'a> for BaselineScanRule {
     fn apply(
         &self,
         memo: &mut Memo<'a>,
-        _context: &PlanContext<'a>,
+        context: &PlanContext<'a>,
     ) -> Result<bool, SqlDatabaseError> {
         let mut changed = false;
         let expr_ids: Vec<_> = memo.expressions().map(|expr| expr.id).collect();
@@ -39,17 +39,27 @@ impl<'a> RewriteRule<'a> for BaselineScanRule {
 
             let scan_expr_id = memo.group(child_group).expressions[0];
             {
-                let scan_expr = memo.expression(scan_expr_id);
-                if let MemoExpr::Scan { candidates, .. } = &scan_expr.expr {
+                let scan_expr = memo.expression_mut(scan_expr_id);
+                if let MemoExpr::Scan {
+                    table,
+                    candidates,
+                    options,
+                } = &mut scan_expr.expr
+                {
+                    if matches!(table.source, super::table_ref::TableSource::External) {
+                        if let Some(connector) = context.external() {
+                            if connector.supports_predicate_pushdown(&predicate) {
+                                if options.pushdown_predicate.as_ref() != Some(&predicate) {
+                                    options.pushdown_predicate = Some(predicate.clone());
+                                    changed = true;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if !candidates.is_all() {
                         continue;
                     }
-                }
-            }
-
-            {
-                let scan_expr = memo.expression_mut(scan_expr_id);
-                if let MemoExpr::Scan { table, candidates } = &mut scan_expr.expr {
                     let computed = compute_candidate_rows(*table, &predicate)?;
                     if let Some(rows) = computed {
                         *candidates = ScanCandidates::Fixed(rows);

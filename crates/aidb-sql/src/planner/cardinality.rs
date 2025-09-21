@@ -73,6 +73,18 @@ impl<'a> CardinalityEstimator<'a> {
     fn selectivity_for(&self, predicate: &Predicate) -> (f64, f64) {
         match predicate {
             Predicate::Equals { column, value } => self.estimate_equality(column, value),
+            Predicate::GreaterOrEqual { column, value } => {
+                if let Some(max_value) = self
+                    .context
+                    .statistics()
+                    .column_stats(column)
+                    .and_then(|stats| stats.max.clone())
+                {
+                    self.estimate_range(column, value, &max_value)
+                } else {
+                    (DEFAULT_SELECTIVITY, 0.1)
+                }
+            }
             Predicate::Between { column, start, end } => self.estimate_range(column, start, end),
             Predicate::IsNull { column } => self.estimate_is_null(column),
             Predicate::InTableColumn { .. } => (DEFAULT_IN_SUBQUERY_SELECTIVITY, 0.1),

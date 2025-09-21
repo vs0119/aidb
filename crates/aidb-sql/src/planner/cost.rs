@@ -46,14 +46,37 @@ impl CostModel {
         predicate: Option<&Predicate>,
     ) -> CostEstimate {
         let estimator = CardinalityEstimator::new(context);
-        let cardinality = estimator.estimate_filter(predicate);
-        let row_width = context.statistics().average_row_width();
+        let mut cardinality = estimator.estimate_filter(predicate);
+        let mut row_width = context.statistics().average_row_width();
+        if let Some(connector) = context.external() {
+            let factors = connector.cost_factors();
+            if let Some(pred) = predicate {
+                if connector.supports_predicate_pushdown(pred) {
+                    cardinality = cardinality.scale(factors.pushdown_selectivity, 0.2);
+                }
+            }
+            row_width *= factors.remote_io_multiplier;
+            let io_cost = if row_width <= 0.0 {
+                0.0
+            } else {
+                (cardinality.estimated_rows * row_width) / self.page_size_bytes
+            };
+            let cpu_cost =
+                cardinality.estimated_rows * self.cpu_cost_per_row * factors.remote_cpu_multiplier;
+            return CostEstimate {
+                cardinality,
+                cpu_cost,
+                io_cost,
+            };
+        }
+
         let io_cost = if row_width <= 0.0 {
             0.0
         } else {
             (cardinality.estimated_rows * row_width) / self.page_size_bytes
         };
         let cpu_cost = cardinality.estimated_rows * self.cpu_cost_per_row;
+
         CostEstimate {
             cardinality,
             cpu_cost,
