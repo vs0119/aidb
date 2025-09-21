@@ -96,7 +96,8 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
-        .background(Color(NSColor.controlBackgroundColor))
+        .scrollContentBackground(.hidden)
+        .background(Color.white)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -122,6 +123,16 @@ struct SidebarView: View {
         .sheet(isPresented: $showingSQLQuery) {
             SQLQueryInterface()
                 .environmentObject(model)
+                .onAppear {
+                    // Force app focus when sheet appears
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        NSApp.activate(ignoringOtherApps: true)
+                        if let window = NSApp.keyWindow ?? NSApp.windows.first {
+                            window.makeKeyAndOrderFront(nil)
+                            window.orderFrontRegardless()
+                        }
+                    }
+                }
         }
     }
 }
@@ -214,82 +225,117 @@ struct ConnectionView: View {
     @State private var checking = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                HStack(spacing: 8) {
-                    Image(systemName: model.healthOK ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(model.healthOK ? .green : .orange)
-                        .font(.caption)
+        VStack(spacing: 18) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .center) {
+                    StatusPill(
+                        tone: model.healthOK ? .success : .warning,
+                        label: model.healthOK ? "Live connection" : "Check connection",
+                        systemImage: model.healthOK ? "checkmark.seal.fill" : "exclamationmark.triangle.fill"
+                    )
 
-                    TextField("Server URL", text: $base)
-                        .textFieldStyle(.plain)
-                        .disableAutocorrection(true)
-                        .font(.system(.body, design: .monospaced))
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(Color(NSColor.textBackgroundColor))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(model.healthOK ? Color.green.opacity(0.3) : Color.gray.opacity(0.3), lineWidth: 1)
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+                    Spacer()
 
-                Button {
-                    checking = true
-                    Task {
-                        model.updateBaseURL(base)
-                        await model.refreshAll()
-                        await MainActor.run {
-                            checking = false
-                            model.clearError()
+                    Button(action: connect) {
+                        HStack(spacing: 6) {
+                            if checking {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                                    .scaleEffect(0.70)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 13, weight: .semibold))
+                            }
+                            Text(checking ? "Updating" : "Connect")
                         }
                     }
-                } label: {
-                    HStack(spacing: 4) {
-                        if checking {
-                            ProgressView()
-                                .progressViewStyle(.circular)
-                                .scaleEffect(0.7)
-                        } else {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.caption.weight(.medium))
-                        }
-                        Text(checking ? "Updating…" : "Connect")
-                            .font(.caption.weight(.medium))
-                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .disabled(checking || base.isEmpty)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(checking || base.isEmpty)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Endpoint")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    HStack(spacing: 10) {
+                        Image(systemName: "network")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        TextField("Server URL", text: $base)
+                            .textFieldStyle(.plain)
+                            .font(.system(.body, design: .monospaced))
+                            .disableAutocorrection(true)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: AIDBTokens.Radius.large, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: AIDBTokens.Radius.large, style: .continuous)
+                            .stroke(model.healthOK ? AIDBColors.accent.opacity(0.35) : Color.white.opacity(0.18), lineWidth: 1)
+                    )
+                }
             }
+            .glassCard()
 
-            GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
                 HStack {
+                    Label("Auto Refresh", systemImage: "timer")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Text(model.autoRefreshEnabled ? "Every \(Int(model.autoRefreshInterval))s" : "Disabled")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 12) {
                     Toggle("Auto refresh", isOn: $model.autoRefreshEnabled)
                         .toggleStyle(.switch)
 
                     Spacer()
 
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text("Every \(Int(model.autoRefreshInterval))s")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.primary)
-
-                        Stepper(value: $model.autoRefreshInterval, in: 5...120, step: 5) {
-                            EmptyView()
-                        }
-                        .labelsHidden()
+                    Stepper(value: $model.autoRefreshInterval, in: 5...120, step: 5) {
+                        Text("Interval")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
+                    .labelsHidden()
                 }
-            } label: {
-                Label("Auto Refresh", systemImage: "timer")
-                    .font(.caption.weight(.medium))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: AIDBTokens.Radius.medium, style: .continuous)
+                        .fill(Color.white.opacity(0.05))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: AIDBTokens.Radius.medium, style: .continuous)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
             }
+            .glassCard(cornerRadius: AIDBTokens.Radius.large)
             .disabled(!model.healthOK)
         }
         .onAppear {
             base = model.baseURLText
+        }
+    }
+
+    private func connect() {
+        guard !checking else { return }
+        checking = true
+        Task {
+            await MainActor.run { model.updateBaseURL(base) }
+            await model.refreshAll()
+            await MainActor.run {
+                checking = false
+                model.clearError()
+            }
         }
     }
 }
@@ -905,23 +951,106 @@ struct FilterBuilderView: View {
 
 struct ErrorBanner: View {
     let message: String
+    var onDismiss: (() -> Void)?
+    @State private var appear = false
+
     var body: some View {
-        Text(message)
-            .padding(.vertical, 8)
-            .padding(.horizontal, 16)
-            .frame(maxWidth: .infinity)
-            .background(Color.red.opacity(0.9))
-            .foregroundStyle(.white)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .padding(.horizontal)
+        HStack(alignment: .center, spacing: 14) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 18, weight: .bold))
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, Color.white.opacity(0.35))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Heads up")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.92))
+                Text(message)
+                    .font(.system(.footnote, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.88))
+                    .lineLimit(3)
+            }
+
+            Spacer()
+
+            if let onDismiss {
+                Button {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                        appear = false
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        onDismiss()
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .bold))
+                        .padding(8)
+                        .background(Color.white.opacity(0.12), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss error")
+            }
+        }
+        .padding(.vertical, 14)
+        .padding(.horizontal, 18)
+        .frame(maxWidth: .infinity)
+        .background(AIDBColors.destructiveGradient, in: RoundedRectangle(cornerRadius: AIDBTokens.Radius.large, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: AIDBTokens.Radius.large, style: .continuous)
+                .stroke(Color.white.opacity(0.18), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.25), radius: 18, x: 0, y: 14)
+        .padding(.horizontal)
+        .padding(.top, 6)
+        .opacity(appear ? 1 : 0)
+        .offset(y: appear ? 0 : -18)
+        .onAppear {
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+                appear = true
+            }
+        }
     }
 }
 
 struct ProgressOverlay: View {
+    @State private var pulse = false
+
     var body: some View {
         ZStack {
-            Color.black.opacity(0.15).ignoresSafeArea()
-            ProgressView().progressViewStyle(.circular)
+            Color.black.opacity(0.28).ignoresSafeArea()
+
+            VStack(spacing: 16) {
+                ZStack {
+                    Circle()
+                        .stroke(AIDBColors.accent.opacity(0.35), lineWidth: 2)
+                        .frame(width: 66, height: 66)
+                        .scaleEffect(pulse ? 1.12 : 0.92)
+                        .opacity(pulse ? 0.25 : 0.45)
+                        .animation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true), value: pulse)
+
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .scaleEffect(1.2)
+                }
+
+                Text("Refreshing workspace…")
+                    .font(.system(.callout, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.88))
+            }
+            .padding(26)
+            .background(
+                RoundedRectangle(cornerRadius: AIDBTokens.Radius.large, style: .continuous)
+                    .fill(Color.white.opacity(0.05))
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: AIDBTokens.Radius.large, style: .continuous))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: AIDBTokens.Radius.large, style: .continuous)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+            .shadow(color: Color.black.opacity(0.26), radius: 18, x: 0, y: 14)
+        }
+        .onAppear {
+            pulse = true
         }
     }
 }
@@ -1856,6 +1985,16 @@ struct TableDataView: View {
         .sheet(isPresented: $showingSQLQuery) {
             SQLQueryInterface(table: table)
                 .environmentObject(model)
+                .onAppear {
+                    // Force app focus when sheet appears
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        NSApp.activate(ignoringOtherApps: true)
+                        if let window = NSApp.keyWindow ?? NSApp.windows.first {
+                            window.makeKeyAndOrderFront(nil)
+                            window.orderFrontRegardless()
+                        }
+                    }
+                }
         }
         .task {
             await loadData()
@@ -2509,7 +2648,13 @@ struct DashboardView: View {
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 40)
         }
-        .background(Color(NSColor.controlBackgroundColor))
+        .background(
+            LinearGradient(
+                colors: [Color(red: 0.05, green: 0.06, blue: 0.09), Color(red: 0.09, green: 0.1, blue: 0.15)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
     }
 }
 
@@ -2524,11 +2669,11 @@ struct DashboardCard: View {
         VStack(spacing: 16) {
             HStack {
                 Image(systemName: icon)
-                    .font(.title2)
+                    .font(.system(size: 28, weight: .semibold))
                     .foregroundStyle(color)
                 Spacer()
                 Text("\(count)")
-                    .font(.title.weight(.bold))
+                    .font(.system(size: 28, weight: .heavy, design: .rounded))
                     .foregroundStyle(color)
             }
 
@@ -2543,14 +2688,7 @@ struct DashboardCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .padding(20)
-        .background(Color(NSColor.controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 16))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(color.opacity(0.2), lineWidth: 2)
-        )
-        .shadow(color: .black.opacity(0.05), radius: 8, x: 0, y: 2)
+        .glassCard(cornerRadius: 20, strokeColor: color.opacity(0.28))
     }
 }
 

@@ -31,7 +31,9 @@ struct RootView: View {
                 }
             }
             if let message = model.errorMessage {
-                ErrorBanner(message: message)
+                ErrorBanner(message: message, onDismiss: {
+                    model.clearError()
+                })
                     .transition(.move(edge: .top).combined(with: .opacity))
                     .padding(.top, 8)
             }
@@ -45,6 +47,15 @@ struct RootView: View {
         }
         .onDisappear {
             model.stopAutoRefresh()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            // Force window focus when app becomes active
+            DispatchQueue.main.async {
+                if let window = NSApp.keyWindow ?? NSApp.windows.first {
+                    window.makeKeyAndOrderFront(nil)
+                    window.orderFrontRegardless()
+                }
+            }
         }
     }
 }

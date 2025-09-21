@@ -118,7 +118,17 @@ final class AIDBClient {
             throw NSError(domain: "AIDBClient", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errorText])
         }
 
-        return try JSONDecoder().decode(SqlResponse.self, from: d)
+        // Try to decode as JSON first, fallback to handling plain text errors
+        do {
+            return try JSONDecoder().decode(SqlResponse.self, from: d)
+        } catch {
+            // If JSON decoding fails, check if it's a plain text error message
+            if let errorText = String(data: d, encoding: .utf8) {
+                throw NSError(domain: "AIDBClient", code: 400, userInfo: [NSLocalizedDescriptionKey: errorText])
+            } else {
+                throw error
+            }
+        }
     }
 
     func listTables() async throws -> [TableInfo] {
