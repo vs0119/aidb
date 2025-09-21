@@ -1,10 +1,7 @@
-use super::operators::{partition_scan_candidates, ScanPartition};
+use super::operators::ScanPartition;
 use super::scheduler::TaskScheduler;
 use crate::planner::{JoinPredicate, JoinType, ScanCandidates};
-use crate::{
-    canonical_json, column_index_in_table, equal, ExecutionStats, Geometry, SqlDatabaseError,
-    Table, Value,
-};
+use crate::{canonical_json, column_index_in_table, equal, ExecutionStats, Geometry, SqlDatabaseError, Table, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +32,23 @@ struct JoinPartitionOutcome {
     rows: Vec<Vec<Value>>,
     input_rows: usize,
     output_rows: usize,
+}
+
+fn partition_probe_rows(total_rows: usize, batch_size: usize) -> Vec<ScanPartition> {
+    if total_rows == 0 || batch_size == 0 {
+        return Vec::new();
+    }
+
+    let mut partitions = Vec::new();
+    let mut start = 0;
+
+    while start < total_rows {
+        let end = (start + batch_size).min(total_rows);
+        partitions.push(ScanPartition::Range { start, end });
+        start = end;
+    }
+
+    partitions
 }
 
 fn value_hash_key(value: &Value) -> Option<String> {
