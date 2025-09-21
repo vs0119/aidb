@@ -3,6 +3,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use roxmltree::Document;
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde_json::Value as JsonValue;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -267,6 +268,34 @@ pub struct SqlDatabase {
     graphs: HashMap<String, Graph>,
     table_stats_catalog: HashMap<String, TableStatistics>,
     column_stats_catalog: HashMap<(String, String), ColumnStatistics>,
+    plan_cache: RefCell<HashMap<PlanCacheKey, CachedSelectResult>>,
+    plan_cache_index: RefCell<HashMap<String, HashSet<PlanCacheKey>>>,
+    plan_cache_stats: RefCell<CacheStats>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub hits: usize,
+    pub misses: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PlanCacheKey {
+    shape: String,
+    params: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSelectResult {
+    result: QueryResult,
+    #[allow(dead_code)]
+    matching_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct PlanCacheMetadata {
+    key: PlanCacheKey,
+    dependent_tables: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -315,6 +344,9 @@ impl SqlDatabase {
             graphs: HashMap::new(),
             table_stats_catalog: HashMap::new(),
             column_stats_catalog: HashMap::new(),
+            plan_cache: RefCell::new(HashMap::new()),
+            plan_cache_index: RefCell::new(HashMap::new()),
+            plan_cache_stats: RefCell::new(CacheStats::default()),
         };
         db.initialize_system_catalog();
         db
@@ -345,6 +377,7 @@ impl SqlDatabase {
     }
 
     fn refresh_stats_catalog_tables(&mut self) {
+        let mut updated_tables: Vec<&'static str> = Vec::new();
         if let Some(table) = self.system_tables.get_mut(TABLE_STATS_TABLE) {
             table.rows.clear();
             let mut entries: Vec<_> = self.table_stats_catalog.values().cloned().collect();
@@ -357,6 +390,7 @@ impl SqlDatabase {
                     Value::Integer(stat.stats_version as i64),
                 ]);
             }
+            updated_tables.push(TABLE_STATS_TABLE);
         }
         if let Some(table) = self.system_tables.get_mut(COLUMN_STATS_TABLE) {
             table.rows.clear();
@@ -384,6 +418,10 @@ impl SqlDatabase {
                     Value::Integer(stat.stats_version as i64),
                 ]);
             }
+            updated_tables.push(COLUMN_STATS_TABLE);
+        }
+        for table in updated_tables {
+            self.invalidate_cache_for_table(table);
         }
     }
 
@@ -424,6 +462,14 @@ impl SqlDatabase {
             other => other,
         });
         stats
+    }
+
+    pub fn cache_stats(&self) -> CacheStats {
+        *self.plan_cache_stats.borrow()
+    }
+
+    pub fn notify_materialized_view_update(&mut self, name: &str) {
+        self.invalidate_cache_for_table(name);
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, SqlDatabaseError> {
@@ -522,7 +568,9 @@ impl SqlDatabase {
                 granularity: info.granularity,
             });
         }
+        let table_name = name.clone();
         self.tables.insert(name, table);
+        self.invalidate_cache_for_table(&table_name);
         Ok(())
     }
 
@@ -580,6 +628,7 @@ impl SqlDatabase {
             update_indexes_for_row(table, row_index);
             inserted += 1;
         }
+        self.invalidate_cache_for_table(&table_name);
         Ok(inserted)
     }
 
@@ -740,6 +789,14 @@ impl SqlDatabase {
         expr: &planner::LogicalExpr,
         cte_tables: &HashMap<String, Table>,
     ) -> Result<QueryResult, SqlDatabaseError> {
+        let cache_metadata = Self::plan_cache_metadata(expr, cte_tables);
+        if let Some(meta) = cache_metadata.as_ref() {
+            if let Some(entry) = self.plan_cache.borrow().get(&meta.key) {
+                self.plan_cache_stats.borrow_mut().hits += 1;
+                return Ok(entry.result.clone());
+            }
+        }
+
         let (projection, predicate, scan) = match expr {
             planner::LogicalExpr::Projection(projection) => match projection.input.as_ref() {
                 planner::LogicalExpr::Filter(filter) => match filter.input.as_ref() {
@@ -769,17 +826,17 @@ impl SqlDatabase {
             matching_indices.push(row_index);
         }
 
-        match &projection.columns {
+        let result = match &projection.columns {
             SelectColumns::All => {
                 let column_names = table.columns.iter().map(|c| c.name.clone()).collect();
                 let rows = matching_indices
-                    .into_iter()
-                    .map(|idx| table.rows[idx].clone())
+                    .iter()
+                    .map(|&idx| table.rows[idx].clone())
                     .collect();
-                Ok(QueryResult::Rows {
+                QueryResult::Rows {
                     columns: column_names,
                     rows,
-                })
+                }
             }
             SelectColumns::Some(items) => {
                 let mut projections = Vec::new();
@@ -818,7 +875,7 @@ impl SqlDatabase {
                     window_values.push(values);
                 }
 
-                let mut rows = Vec::new();
+                let mut rows = Vec::with_capacity(matching_indices.len());
                 for (position, &row_index) in matching_indices.iter().enumerate() {
                     let row = &table.rows[row_index];
                     let mut output_row = Vec::with_capacity(projections.len());
@@ -840,9 +897,16 @@ impl SqlDatabase {
                     .map(|projection| projection.output_name)
                     .collect();
 
-                Ok(QueryResult::Rows { columns, rows })
+                QueryResult::Rows { columns, rows }
             }
+        };
+
+        if let Some(metadata) = cache_metadata {
+            self.plan_cache_stats.borrow_mut().misses += 1;
+            self.store_plan_cache(metadata, matching_indices, result.clone());
         }
+
+        Ok(result)
     }
 
     fn materialize_ctes(
@@ -915,6 +979,215 @@ impl SqlDatabase {
             tables.insert(cte.name.clone(), table);
         }
         Ok(tables)
+    }
+
+    fn store_plan_cache(
+        &self,
+        metadata: PlanCacheMetadata,
+        matching_indices: Vec<usize>,
+        result: QueryResult,
+    ) {
+        let PlanCacheMetadata {
+            key,
+            dependent_tables,
+        } = metadata;
+        {
+            let mut cache = self.plan_cache.borrow_mut();
+            cache.insert(
+                key.clone(),
+                CachedSelectResult {
+                    result,
+                    matching_indices,
+                },
+            );
+        }
+        let mut index = self.plan_cache_index.borrow_mut();
+        for table in dependent_tables {
+            index.entry(table).or_default().insert(key.clone());
+        }
+    }
+
+    fn invalidate_cache_for_table(&self, table: &str) {
+        let mut index = self.plan_cache_index.borrow_mut();
+        if let Some(keys) = index.remove(table) {
+            let key_list: Vec<_> = keys.into_iter().collect();
+            {
+                let mut cache = self.plan_cache.borrow_mut();
+                for key in &key_list {
+                    cache.remove(key);
+                }
+            }
+            for entries in index.values_mut() {
+                for key in &key_list {
+                    entries.remove(key);
+                }
+            }
+        }
+    }
+
+    fn plan_cache_metadata(
+        expr: &planner::LogicalExpr,
+        cte_tables: &HashMap<String, Table>,
+    ) -> Option<PlanCacheMetadata> {
+        let mut params = Vec::new();
+        let (shape, mut dependencies) =
+            Self::logical_expr_signature(expr, &mut params, cte_tables)?;
+        dependencies.sort();
+        dependencies.dedup();
+        if dependencies.is_empty() {
+            return None;
+        }
+        let key = PlanCacheKey { shape, params };
+        Some(PlanCacheMetadata {
+            key,
+            dependent_tables: dependencies,
+        })
+    }
+
+    fn logical_expr_signature(
+        expr: &planner::LogicalExpr,
+        params: &mut Vec<String>,
+        cte_tables: &HashMap<String, Table>,
+    ) -> Option<(String, Vec<String>)> {
+        match expr {
+            planner::LogicalExpr::Projection(projection) => {
+                let projection_shape = Self::projection_signature(&projection.columns);
+                let (input_shape, dependencies) =
+                    Self::logical_expr_signature(projection.input.as_ref(), params, cte_tables)?;
+                let shape = format!("proj:{projection_shape}|{input_shape}");
+                Some((shape, dependencies))
+            }
+            planner::LogicalExpr::Filter(filter) => {
+                let (predicate_shape, mut predicate_deps) =
+                    Self::predicate_signature(&filter.predicate, params, cte_tables)?;
+                let (input_shape, mut dependencies) =
+                    Self::logical_expr_signature(filter.input.as_ref(), params, cte_tables)?;
+                dependencies.append(&mut predicate_deps);
+                let shape = format!("filter:{predicate_shape}|{input_shape}");
+                Some((shape, dependencies))
+            }
+            planner::LogicalExpr::Scan(scan) => match scan.table.source {
+                planner::TableSource::Cte => None,
+                planner::TableSource::Base | planner::TableSource::System => {
+                    let source = match scan.table.source {
+                        planner::TableSource::Base => "base",
+                        planner::TableSource::System => "system",
+                        planner::TableSource::Cte => unreachable!(),
+                    };
+                    let mut shape = format!("scan:{source}:{}", scan.table.name);
+                    match scan.candidates.as_slice() {
+                        Some(rows) => {
+                            shape.push_str(&format!(":fixed({})", rows.len()));
+                            let candidate_repr = if rows.is_empty() {
+                                String::new()
+                            } else {
+                                rows.iter()
+                                    .map(|idx| idx.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            };
+                            params.push(format!("candidates:{candidate_repr}"));
+                        }
+                        None => shape.push_str(":all"),
+                    }
+                    Some((shape, vec![scan.table.name.to_string()]))
+                }
+            },
+        }
+    }
+
+    fn projection_signature(columns: &SelectColumns) -> String {
+        match columns {
+            SelectColumns::All => "all".to_string(),
+            SelectColumns::Some(items) => {
+                let mut parts = Vec::new();
+                for item in items {
+                    match item {
+                        SelectItem::Column(name) => {
+                            parts.push(format!("col:{}", name.to_ascii_lowercase()));
+                        }
+                        SelectItem::WindowFunction(spec) => {
+                            parts.push(Self::window_function_signature(spec));
+                        }
+                    }
+                }
+                format!("list[{}]", parts.join(","))
+            }
+        }
+    }
+
+    fn window_function_signature(spec: &WindowFunctionExpr) -> String {
+        let mut repr = match spec.function {
+            WindowFunctionType::RowNumber => "win:row_number".to_string(),
+        };
+        if let Some(partition) = &spec.partition_by {
+            repr.push_str(&format!(":partition={}", partition.to_ascii_lowercase()));
+        } else {
+            repr.push_str(":partition=");
+        }
+        repr.push_str(&format!(":order={}", spec.order_by.to_ascii_lowercase()));
+        if let Some(alias) = &spec.alias {
+            repr.push_str(&format!(":alias={alias}"));
+        }
+        repr
+    }
+
+    fn predicate_signature(
+        predicate: &Predicate,
+        params: &mut Vec<String>,
+        cte_tables: &HashMap<String, Table>,
+    ) -> Option<(String, Vec<String>)> {
+        match predicate {
+            Predicate::Equals { column, value } => {
+                params.push(value_fingerprint(value));
+                Some((format!("eq:{}", column.to_ascii_lowercase()), Vec::new()))
+            }
+            Predicate::Between { column, start, end } => {
+                let mut start_key = value_fingerprint(start);
+                let mut end_key = value_fingerprint(end);
+                if matches!(compare_values(start, end), Some(Ordering::Greater)) {
+                    std::mem::swap(&mut start_key, &mut end_key);
+                }
+                params.push(start_key);
+                params.push(end_key);
+                Some((
+                    format!("between:{}", column.to_ascii_lowercase()),
+                    Vec::new(),
+                ))
+            }
+            Predicate::IsNull { column } => Some((
+                format!("is_null:{}", column.to_ascii_lowercase()),
+                Vec::new(),
+            )),
+            Predicate::InTableColumn {
+                column,
+                table,
+                table_column,
+            } => {
+                if cte_tables.contains_key(table) {
+                    return None;
+                }
+                let shape = format!(
+                    "in:{}->{}.{}",
+                    column.to_ascii_lowercase(),
+                    table.to_ascii_lowercase(),
+                    table_column.to_ascii_lowercase()
+                );
+                Some((shape, vec![table.clone()]))
+            }
+            Predicate::FullText {
+                column,
+                query,
+                language,
+            } => {
+                params.push(format!("query={query}"));
+                params.push(format!("lang={}", language.clone().unwrap_or_default()));
+                Some((
+                    format!("full_text:{}", column.to_ascii_lowercase()),
+                    Vec::new(),
+                ))
+            }
+        }
     }
 
     fn exec_merge(
@@ -1046,6 +1319,7 @@ impl SqlDatabase {
         }
         if modified {
             rebuild_secondary_indexes(target_table);
+            self.invalidate_cache_for_table(&target_name);
         }
 
         Ok(QueryResult::None)
@@ -2497,6 +2771,27 @@ fn clamp_u64_to_i64(value: u64) -> i64 {
     }
 }
 
+fn value_fingerprint(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Integer(i) => format!("i:{i}"),
+        Value::Float(f) => format!("f:{:x}", f.to_bits()),
+        Value::Text(s) => format!("t:{s}"),
+        Value::Boolean(b) => format!("b:{}", *b as u8),
+        Value::Timestamp(ts) => {
+            let nanos = ts.timestamp_nanos_opt().unwrap_or_else(|| {
+                ts.timestamp().saturating_mul(1_000_000_000)
+                    + i64::from(ts.timestamp_subsec_nanos())
+            });
+            format!("ts:{nanos}")
+        }
+        Value::Json(v) => format!("j:{}", canonical_json(v)),
+        Value::Jsonb(v) => format!("jb:{}", canonical_json(v)),
+        Value::Xml(s) => format!("x:{s}"),
+        Value::Geometry(g) => format!("g:{}", geometry_to_string(g)),
+    }
+}
+
 fn value_to_plain_string(value: &Value) -> String {
     match value {
         Value::Text(s) => s.clone(),
@@ -3821,6 +4116,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn row_values(result: &QueryResult) -> &Vec<Vec<Value>> {
+        match result {
+            QueryResult::Rows { rows, .. } => rows,
+            _ => panic!("expected rows result"),
+        }
+    }
+
     #[test]
     fn create_insert_select_flow() {
         let mut db = SqlDatabase::new();
@@ -4748,5 +5050,77 @@ mod tests {
             }
             _ => panic!("unexpected result"),
         }
+    }
+
+    #[test]
+    fn select_cache_hits_and_invalidation_on_insert() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+
+        assert_eq!(db.cache_stats().hits, 0);
+        assert_eq!(db.cache_stats().misses, 0);
+
+        let first = db
+            .execute("SELECT id, name FROM users WHERE id = 1;")
+            .unwrap();
+        assert_eq!(row_values(&first).len(), 1);
+        assert_eq!(db.cache_stats().misses, 1);
+        assert_eq!(db.cache_stats().hits, 0);
+
+        let second = db
+            .execute("SELECT id, name FROM users WHERE id = 1;")
+            .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(db.cache_stats().hits, 1);
+
+        db.execute("INSERT INTO users VALUES (2, 'Bob');").unwrap();
+        let stats_after_insert = db.cache_stats();
+        assert_eq!(stats_after_insert.hits, 1);
+
+        let third = db
+            .execute("SELECT id, name FROM users WHERE id = 1;")
+            .unwrap();
+        assert_eq!(third, first);
+        let stats_after_third = db.cache_stats();
+        assert_eq!(stats_after_third.hits, 1);
+        assert_eq!(stats_after_third.misses, stats_after_insert.misses + 1);
+    }
+
+    #[test]
+    fn cache_invalidation_for_stats_tables_and_mv_hook() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE items (id INT, name TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 'alpha');")
+            .unwrap();
+
+        let first = db.execute("SELECT * FROM __aidb_table_stats;").unwrap();
+        assert!(row_values(&first).is_empty());
+        let after_first = db.cache_stats();
+        assert_eq!(after_first.misses, 1);
+
+        let second = db.execute("SELECT * FROM __aidb_table_stats;").unwrap();
+        assert_eq!(row_values(&second), row_values(&first));
+        let after_second = db.cache_stats();
+        assert_eq!(after_second.hits, after_first.hits + 1);
+
+        db.execute("ANALYZE items;").unwrap();
+        let stats_after_analyze = db.cache_stats();
+
+        let third = db.execute("SELECT * FROM __aidb_table_stats;").unwrap();
+        assert!(!row_values(&third).is_empty());
+        let after_third = db.cache_stats();
+        assert_eq!(after_third.misses, stats_after_analyze.misses + 1);
+
+        db.notify_materialized_view_update("__aidb_table_stats");
+        let before_manual_invalidation = db.cache_stats();
+
+        let fourth = db.execute("SELECT * FROM __aidb_table_stats;").unwrap();
+        assert_eq!(row_values(&fourth), row_values(&third));
+        let after_fourth = db.cache_stats();
+        assert_eq!(after_fourth.misses, before_manual_invalidation.misses + 1);
     }
 }

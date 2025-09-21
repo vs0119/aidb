@@ -1,0 +1,26 @@
+repository:
+  name: aidb
+  description: "A Rust-based, AI-optimized vector database with modular storage and indexing."
+  topics:
+    - rust
+    - vector-search
+    - database
+    - artificial-intelligence
+    - observability
+  private: false
+  has_issues: true
+  has_projects: true
+  has_wiki: false
+  default_branch: main
+
+branches:
+  - name: main
+    protection:
+      required_status_checks:
+        strict: true
+        contexts:
+          - CI
+      enforce_admins: true
+      required_pull_request_reviews:
+        required_approving_review_count: 1
+      restrictions: null

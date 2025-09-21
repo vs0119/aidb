@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+      - name: Benchmarks build
+        run: cargo bench --workspace --no-run
+
+      - name: Build docs
+        run: cargo doc --workspace --no-deps
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          python <<'PY'
+import os
+from pathlib import Path
+
+tag = os.environ["GITHUB_REF_NAME"]
+changelog = Path("CHANGELOG.md").read_text().splitlines()
+section = []
+collect = False
+for line in changelog:
+    if line.startswith("## "):
+        if collect:
+            break
+        if line.strip() == f"## [{tag}]":
+            collect = True
+            continue
+    if collect:
+        section.append(line)
+
+if not section:
+    # Fall back to Unreleased section
+    for line in changelog:
+        if line.strip() == "## [Unreleased]":
+            collect = True
+            continue
+        if collect and line.startswith("## ") and line.strip() != "## [Unreleased]":
+            break
+        if collect:
+            section.append(line)
+
+Path("release-notes.md").write_text("\n".join(section).strip() or "Release notes forthcoming.")
+PY
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: |
+            target/doc/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
