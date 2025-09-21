@@ -269,7 +269,7 @@ struct AnyCodable: Codable, Hashable {
 
 // MARK: - App Model
 
-final class AppModel: ObservableObject {
+@MainActor final class AppModel: ObservableObject {
     @Published var baseURL: URL?
     @Published var baseURLText: String
     @Published var healthOK = false
@@ -354,13 +354,9 @@ final class AppModel: ObservableObject {
         baseURL = URL(string: text)
         if let url = baseURL {
             client.baseURL = url
-            Task { @MainActor in
-                self.errorMessage = nil
-            }
+            errorMessage = nil
         } else {
-            Task { @MainActor in
-                self.errorMessage = "Invalid server URL"
-            }
+            errorMessage = "Invalid server URL"
         }
         if autoRefreshEnabled {
             startAutoRefresh()
@@ -369,21 +365,19 @@ final class AppModel: ObservableObject {
 
     func refreshAll(showSpinner: Bool = true) async {
         guard baseURL != nil else { return }
-        if showSpinner {
-            await MainActor.run { self.isRefreshing = true }
+        if showSpinner { isRefreshing = true }
+        defer {
+            if showSpinner { isRefreshing = false }
         }
         await refreshHealth()
         await loadCollections()
-        if showSpinner {
-            await MainActor.run { self.isRefreshing = false }
-        }
     }
 
     func refreshHealth() async {
         guard baseURL != nil else { return }
         do {
             let ok = try await client.health()
-            await MainActor.run { self.healthOK = ok }
+            healthOK = ok
         } catch {
             await report(error)
         }
@@ -393,13 +387,11 @@ final class AppModel: ObservableObject {
         guard baseURL != nil else { return }
         do {
             let list = try await client.listCollections()
-            await MainActor.run {
-                self.collections = list
-                if let sel = self.selection {
-                    self.selection = list.first(where: { $0.id == sel.id }) ?? list.first
-                } else {
-                    self.selection = list.first
-                }
+            collections = list
+            if let sel = selection {
+                selection = list.first(where: { $0.id == sel.id }) ?? list.first
+            } else {
+                selection = list.first
             }
         } catch {
             await report(error)
@@ -410,12 +402,10 @@ final class AppModel: ObservableObject {
         guard baseURL != nil else { return nil }
         do {
             let detail = try await client.getCollectionInfo(name: name)
-            await MainActor.run {
-                if let idx = self.collections.firstIndex(where: { $0.id == detail.id }) {
-                    self.collections[idx] = detail
-                } else {
-                    self.collections.append(detail)
-                }
+            if let idx = collections.firstIndex(where: { $0.id == detail.id }) {
+                collections[idx] = detail
+            } else {
+                collections.append(detail)
             }
             return detail
         } catch {
@@ -443,15 +433,14 @@ final class AppModel: ObservableObject {
     }
 
     func report(_ error: Error) async {
-        await MainActor.run {
-            self.errorMessage = error.localizedDescription
-            self.errorClearTask?.cancel()
-            self.errorClearTask = Task {
-                try? await Task.sleep(for: .seconds(5))
-                await MainActor.run {
-                    if self.errorMessage == error.localizedDescription {
-                        self.errorMessage = nil
-                    }
+        errorMessage = error.localizedDescription
+        errorClearTask?.cancel()
+        errorClearTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            await MainActor.run {
+                guard let self else { return }
+                if self.errorMessage == error.localizedDescription {
+                    self.errorMessage = nil
                 }
             }
         }
@@ -464,16 +453,14 @@ final class AppModel: ObservableObject {
     func rememberVector(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        Task { @MainActor [trimmed] in
-            if let idx = recentVectors.firstIndex(of: trimmed) {
-                recentVectors.remove(at: idx)
-            }
-            recentVectors.insert(trimmed, at: 0)
-            if recentVectors.count > 10 {
-                recentVectors = Array(recentVectors.prefix(10))
-            }
-            self.defaults.set(recentVectors, forKey: recentVectorsKey)
+        if let idx = recentVectors.firstIndex(of: trimmed) {
+            recentVectors.remove(at: idx)
         }
+        recentVectors.insert(trimmed, at: 0)
+        if recentVectors.count > 10 {
+            recentVectors = Array(recentVectors.prefix(10))
+        }
+        defaults.set(recentVectors, forKey: recentVectorsKey)
     }
 
     // MARK: - Statistics Methods
@@ -484,19 +471,17 @@ final class AppModel: ObservableObject {
             let tableStats = try await client.getTableStatistics()
             let columnStats = try await client.getColumnStatistics()
 
-            await MainActor.run {
-                self.statisticsSummary = summary
-                self.tableStatistics = tableStats
-                self.columnStatistics = columnStats
-            }
+            statisticsSummary = summary
+            tableStatistics = tableStats
+            columnStatistics = columnStats
         } catch {
             await report(error)
         }
     }
 
     func analyzeTable(_ tableName: String?) async {
-        await MainActor.run { isAnalyzing = true }
-        defer { Task { @MainActor in isAnalyzing = false } }
+        isAnalyzing = true
+        defer { isAnalyzing = false }
 
         do {
             try await client.analyzeTable(tableName)

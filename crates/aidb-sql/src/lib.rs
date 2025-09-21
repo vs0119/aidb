@@ -6,10 +6,16 @@ use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
+mod execution;
 mod planner;
+
+use execution::TaskScheduler;
+
+pub use planner::JoinPredicate;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum Value {
@@ -70,6 +76,9 @@ pub(crate) struct Table {
     pub(crate) spatial_indexes: HashMap<usize, SpatialIndex>,
 }
 
+unsafe impl Send for Table {}
+unsafe impl Sync for Table {}
+
 impl Default for Table {
     fn default() -> Self {
         Self {
@@ -82,6 +91,28 @@ impl Default for Table {
             xml_indexes: HashMap::new(),
             spatial_indexes: HashMap::new(),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TableHandle {
+    ptr: usize,
+    _marker: std::marker::PhantomData<*const Table>,
+}
+
+unsafe impl Send for TableHandle {}
+unsafe impl Sync for TableHandle {}
+
+impl TableHandle {
+    fn new(table: &Table) -> Self {
+        Self {
+            ptr: table as *const Table as usize,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    unsafe fn get(&self) -> &Table {
+        &*(self.ptr as *const Table)
     }
 }
 
@@ -271,6 +302,9 @@ pub struct SqlDatabase {
     plan_cache: RefCell<HashMap<PlanCacheKey, CachedSelectResult>>,
     plan_cache_index: RefCell<HashMap<String, HashSet<PlanCacheKey>>>,
     plan_cache_stats: RefCell<CacheStats>,
+    execution_config: ExecutionConfig,
+    scheduler: Option<Arc<TaskScheduler>>,
+    execution_stats: Arc<Mutex<ExecutionStats>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -336,8 +370,65 @@ pub enum QueryResult {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Auto,
+    Vectorized,
+    Row,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ExecutionStats {
+    pub scan_input_rows: usize,
+    pub scan_output_rows: usize,
+    pub scan_partitions: usize,
+    pub scan_skew_detected: bool,
+    pub join_build_rows: usize,
+    pub join_probe_rows: usize,
+    pub join_output_rows: usize,
+    pub join_skew_detected: bool,
+    pub join_strategy_switches: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionConfig {
+    pub batch_size: usize,
+    pub max_parallelism: usize,
+    pub skew_threshold: usize,
+}
+
+impl ExecutionConfig {
+    pub fn new(batch_size: usize, max_parallelism: usize) -> Self {
+        let batch = batch_size.max(1);
+        let parallel = max_parallelism.max(1);
+        Self {
+            batch_size: batch,
+            max_parallelism: parallel,
+            skew_threshold: batch * 4,
+        }
+    }
+
+    pub fn with_parallelism(max_parallelism: usize) -> Self {
+        Self::new(execution::DEFAULT_BATCH_SIZE, max_parallelism)
+    }
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        let parallelism = num_cpus::get().max(1);
+        Self {
+            batch_size: execution::DEFAULT_BATCH_SIZE,
+            max_parallelism: parallelism,
+            skew_threshold: execution::DEFAULT_BATCH_SIZE * 4,
+        }
+    }
+}
+
 impl SqlDatabase {
     pub fn new() -> Self {
+        let execution_config = ExecutionConfig::default();
+        let scheduler = SqlDatabase::build_scheduler(execution_config.max_parallelism);
+        let stats = Arc::new(Mutex::new(ExecutionStats::default()));
         let mut db = Self {
             tables: HashMap::new(),
             system_tables: HashMap::new(),
@@ -347,9 +438,103 @@ impl SqlDatabase {
             plan_cache: RefCell::new(HashMap::new()),
             plan_cache_index: RefCell::new(HashMap::new()),
             plan_cache_stats: RefCell::new(CacheStats::default()),
+            execution_config,
+            scheduler,
+            execution_stats: stats,
         };
         db.initialize_system_catalog();
         db
+    }
+
+    fn build_scheduler(parallelism: usize) -> Option<Arc<TaskScheduler>> {
+        if parallelism > 1 {
+            Some(Arc::new(TaskScheduler::new(parallelism)))
+        } else {
+            None
+        }
+    }
+
+    pub fn execution_config(&self) -> &ExecutionConfig {
+        &self.execution_config
+    }
+
+    pub fn set_execution_config(&mut self, config: ExecutionConfig) {
+        if config.max_parallelism != self.execution_config.max_parallelism {
+            self.scheduler = SqlDatabase::build_scheduler(config.max_parallelism);
+        }
+        self.execution_config = config;
+    }
+
+    pub fn set_skew_threshold(&mut self, threshold: usize) {
+        let mut config = self.execution_config.clone();
+        config.skew_threshold = threshold.max(1);
+        self.set_execution_config(config);
+    }
+
+    pub fn reset_execution_stats(&self) {
+        if let Ok(mut stats) = self.execution_stats.lock() {
+            *stats = ExecutionStats::default();
+        }
+    }
+
+    pub fn last_execution_stats(&self) -> ExecutionStats {
+        self.execution_stats.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    pub fn set_parallelism(&mut self, parallelism: usize) {
+        let mut config = self.execution_config.clone();
+        config.max_parallelism = parallelism.max(1);
+        self.set_execution_config(config);
+    }
+
+    fn record_scan_stats(&self, input: usize, output: usize, partitions: usize, skew: bool) {
+        if let Ok(mut stats) = self.execution_stats.lock() {
+            stats.scan_input_rows = input;
+            stats.scan_output_rows = output;
+            stats.scan_partitions = partitions;
+            stats.scan_skew_detected = skew;
+        }
+    }
+
+    pub fn hash_join(
+        &self,
+        left_table: &str,
+        right_table: &str,
+        predicate: planner::JoinPredicate,
+    ) -> Result<QueryResult, SqlDatabaseError> {
+        let left = self
+            .tables
+            .get(left_table)
+            .ok_or_else(|| SqlDatabaseError::UnknownTable(left_table.to_string()))?;
+        let right = self
+            .tables
+            .get(right_table)
+            .ok_or_else(|| SqlDatabaseError::UnknownTable(right_table.to_string()))?;
+
+        let rows = execution::parallel_hash_join(
+            left,
+            right,
+            &predicate,
+            self.scheduler.as_deref(),
+            self.execution_config.batch_size,
+            self.execution_config.skew_threshold,
+            Some(&self.execution_stats),
+        )?;
+
+        let mut columns = Vec::with_capacity(left.columns.len() + right.columns.len());
+        columns.extend(
+            left.columns
+                .iter()
+                .map(|c| format!("{left_table}.{}", c.name)),
+        );
+        columns.extend(
+            right
+                .columns
+                .iter()
+                .map(|c| format!("{right_table}.{}", c.name)),
+        );
+
+        Ok(QueryResult::Rows { columns, rows })
     }
 
     fn initialize_system_catalog(&mut self) {
@@ -473,7 +658,16 @@ impl SqlDatabase {
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, SqlDatabaseError> {
+        self.execute_with_mode(sql, ExecutionMode::Auto)
+    }
+
+    pub fn execute_with_mode(
+        &mut self,
+        sql: &str,
+        mode: ExecutionMode,
+    ) -> Result<QueryResult, SqlDatabaseError> {
         let stmt = parse_statement(sql)?;
+        self.reset_execution_stats();
         match stmt {
             Statement::CreateTable {
                 name,
@@ -491,7 +685,7 @@ impl SqlDatabase {
                 let inserted = self.exec_insert(table, columns, rows)?;
                 Ok(QueryResult::Inserted(inserted))
             }
-            Statement::Select { ctes, body } => self.exec_select(ctes, body),
+            Statement::Select { ctes, body } => self.exec_select(ctes, body, mode),
             Statement::Merge { ctes, merge } => self.exec_merge(ctes, merge),
             Statement::CreateGraph { name } => {
                 self.exec_create_graph(name)?;
@@ -713,15 +907,17 @@ impl SqlDatabase {
         &self,
         ctes: Vec<CommonTableExpression>,
         body: SelectStatement,
+        mode: ExecutionMode,
     ) -> Result<QueryResult, SqlDatabaseError> {
-        let cte_tables = self.materialize_ctes(&ctes)?;
-        self.exec_select_statement(&cte_tables, &body)
+        let cte_tables = self.materialize_ctes(&ctes, mode)?;
+        self.exec_select_statement(&cte_tables, &body, mode)
     }
 
     fn exec_select_statement(
         &self,
         cte_tables: &HashMap<String, Table>,
         select: &SelectStatement,
+        mode: ExecutionMode,
     ) -> Result<QueryResult, SqlDatabaseError> {
         if let Some(table) = cte_tables.get(&select.table) {
             let resolved = planner::ResolvedTable::new(
@@ -734,6 +930,7 @@ impl SqlDatabase {
                 &select.columns,
                 select.predicate.as_ref(),
                 cte_tables,
+                mode,
             )
         } else if let Some(table) = self.tables.get(&select.table) {
             let resolved = planner::ResolvedTable::new(
@@ -746,6 +943,7 @@ impl SqlDatabase {
                 &select.columns,
                 select.predicate.as_ref(),
                 cte_tables,
+                mode,
             )
         } else if let Some(table) = self.system_tables.get(&select.table) {
             let resolved = planner::ResolvedTable::new(
@@ -758,6 +956,7 @@ impl SqlDatabase {
                 &select.columns,
                 select.predicate.as_ref(),
                 cte_tables,
+                mode,
             )
         } else {
             Err(SqlDatabaseError::UnknownTable(select.table.clone()))
@@ -770,6 +969,7 @@ impl SqlDatabase {
         columns: &SelectColumns,
         predicate: Option<&Predicate>,
         cte_tables: &HashMap<String, Table>,
+        mode: ExecutionMode,
     ) -> Result<QueryResult, SqlDatabaseError> {
         let table_stats = self.get_table_statistics(table_ref.name);
         let column_stats = self.column_statistics(table_ref.name);
@@ -781,13 +981,14 @@ impl SqlDatabase {
         let plan = builder.project(columns.clone()).build();
         let planner = planner::Planner::new(context);
         let optimized = planner.optimize(plan)?;
-        self.execute_select_plan(&optimized.root, cte_tables)
+        self.execute_select_plan(&optimized.root, cte_tables, mode)
     }
 
     fn execute_select_plan(
         &self,
         expr: &planner::LogicalExpr,
         cte_tables: &HashMap<String, Table>,
+        mode: ExecutionMode,
     ) -> Result<QueryResult, SqlDatabaseError> {
         let cache_metadata = Self::plan_cache_metadata(expr, cte_tables);
         if let Some(meta) = cache_metadata.as_ref() {
@@ -808,7 +1009,41 @@ impl SqlDatabase {
             },
             _ => return Err(SqlDatabaseError::Unsupported),
         };
+        let vectorized_result = match mode {
+            ExecutionMode::Auto | ExecutionMode::Vectorized => {
+                self.try_vectorized_select(projection, predicate, scan, cte_tables)?
+            }
+            ExecutionMode::Row => None,
+        };
 
+        match mode {
+            ExecutionMode::Auto => {
+                if let Some(result) = vectorized_result {
+                    Ok(result)
+                } else {
+                    self.execute_select_plan_row(projection, predicate, scan, cte_tables)
+                }
+            }
+            ExecutionMode::Vectorized => {
+                if let Some(result) = vectorized_result {
+                    Ok(result)
+                } else {
+                    Err(SqlDatabaseError::Unsupported)
+                }
+            }
+            ExecutionMode::Row => {
+                self.execute_select_plan_row(projection, predicate, scan, cte_tables)
+            }
+        }
+    }
+
+    fn execute_select_plan_row(
+        &self,
+        projection: &planner::ProjectionExpr,
+        predicate: Option<&Predicate>,
+        scan: &planner::ScanExpr,
+        cte_tables: &HashMap<String, Table>,
+    ) -> Result<QueryResult, SqlDatabaseError> {
         let table = scan.table.table;
         let iter: Box<dyn Iterator<Item = usize>> = match scan.candidates.as_slice() {
             Some(rows) => Box::new(rows.iter().copied()),
@@ -845,7 +1080,7 @@ impl SqlDatabase {
                 for item in items {
                     match item {
                         SelectItem::Column(name) => {
-                            let idx = self.column_index(table, name)?;
+                            let idx = self.column_index(table, name.as_str())?;
                             let output_name = table.columns[idx].name.clone();
                             projections.push(PreparedProjection {
                                 output_name,
@@ -909,9 +1144,265 @@ impl SqlDatabase {
         Ok(result)
     }
 
+    fn try_vectorized_select(
+        &self,
+        projection: &planner::ProjectionExpr,
+        predicate: Option<&Predicate>,
+        scan: &planner::ScanExpr,
+        cte_tables: &HashMap<String, Table>,
+    ) -> Result<Option<QueryResult>, SqlDatabaseError> {
+        use execution::{append_rows, apply_predicate, build_batch_for_partition, partition_scan_candidates};
+
+        #[derive(Default)]
+        struct PartitionOutcome {
+            rows: Vec<Vec<Value>>,
+            input_rows: usize,
+            output_rows: usize,
+            skew: bool,
+        }
+
+        let table = scan.table.table;
+
+        let (projection_indices, output_columns) = match &projection.columns {
+            SelectColumns::All => {
+                let indices: Vec<usize> = (0..table.columns.len()).collect();
+                let columns = table.columns.iter().map(|c| c.name.clone()).collect();
+                (indices, columns)
+            }
+            SelectColumns::Some(items) => {
+                let mut indices = Vec::with_capacity(items.len());
+                let mut columns = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        SelectItem::Column(name) => {
+                            let idx = self.column_index(table, name.as_str())?;
+                            indices.push(idx);
+                            columns.push(table.columns[idx].name.clone());
+                        }
+                        SelectItem::WindowFunction(_) => {
+                            return Ok(None);
+                        }
+                    }
+                }
+                (indices, columns)
+            }
+        };
+
+        let prepared_predicate = match predicate {
+            Some(pred) => Some(self.prepare_batch_predicate(table, pred, cte_tables)?),
+            None => None,
+        };
+
+        let chunk_size = self.execution_config.batch_size.max(1);
+        let partitions = partition_scan_candidates(&scan.candidates, table.rows.len(), chunk_size);
+
+        if partitions.is_empty() {
+            self.record_scan_stats(0, 0, 0, false);
+            return Ok(Some(QueryResult::Rows {
+                columns: output_columns,
+                rows: Vec::new(),
+            }));
+        }
+
+        let threshold = self.execution_config.skew_threshold.max(1);
+        let partition_count = partitions.len();
+
+        let mut total_input = 0usize;
+        let mut total_output = 0usize;
+        let mut skew_detected = false;
+
+        let parallelism = self.execution_config.max_parallelism;
+        let use_parallel = parallelism > 1 && partition_count > 1 && self.scheduler.is_some();
+
+        if !use_parallel {
+            let mut rows = Vec::new();
+            let column_types: Vec<ColumnType> = table.columns.iter().map(|c| c.ty).collect();
+            for partition in &partitions {
+                let mut batch = build_batch_for_partition(table, &column_types, partition);
+                let input_rows = batch.len();
+                total_input += input_rows;
+                if input_rows >= threshold {
+                    skew_detected = true;
+                }
+                if let Some(prepared) = prepared_predicate.as_ref() {
+                    apply_predicate(&mut batch, prepared);
+                    if batch.is_empty() {
+                        continue;
+                    }
+                }
+                let output_rows = batch.len();
+                total_output += output_rows;
+                if output_rows == 0 {
+                    continue;
+                }
+                let projected = batch.project(&projection_indices);
+                append_rows(&projected, &mut rows);
+            }
+            self.record_scan_stats(total_input, total_output, partition_count, skew_detected);
+            return Ok(Some(QueryResult::Rows {
+                columns: output_columns,
+                rows,
+            }));
+        }
+
+        let column_types: Vec<ColumnType> = table.columns.iter().map(|c| c.ty).collect();
+        let column_types = Arc::new(column_types);
+        let projection = Arc::new(projection_indices.clone());
+        let predicate = prepared_predicate.clone();
+        let results = Arc::new(Mutex::new(vec![PartitionOutcome::default(); partition_count]));
+        let threshold_arc = Arc::new(threshold);
+        let table_handle = TableHandle::new(table);
+
+        let scheduler = self.scheduler.as_ref().expect("scheduler not initialized");
+        let tasks = partitions
+            .into_iter()
+            .enumerate()
+            .map(|(idx, partition)| {
+                let column_types = Arc::clone(&column_types);
+                let projection = Arc::clone(&projection);
+                let results = Arc::clone(&results);
+                let predicate = predicate.clone();
+                let threshold = Arc::clone(&threshold_arc);
+                move || {
+                    let table_ref = unsafe { table_handle.get() };
+                    let mut batch = build_batch_for_partition(table_ref, column_types.as_slice(), &partition);
+                    let mut outcome = PartitionOutcome {
+                        rows: Vec::new(),
+                        input_rows: batch.len(),
+                        output_rows: 0,
+                        skew: batch.len() >= *threshold,
+                    };
+                    if let Some(prepared) = predicate.as_ref() {
+                        apply_predicate(&mut batch, prepared);
+                        if batch.is_empty() {
+                            let mut guard = results.lock().unwrap();
+                            guard[idx] = outcome;
+                            return;
+                        }
+                    }
+                    outcome.output_rows = batch.len();
+                    if outcome.output_rows > 0 {
+                        let projected = batch.project(projection.as_slice());
+                        append_rows(&projected, &mut outcome.rows);
+                    }
+                    let mut guard = results.lock().unwrap();
+                    guard[idx] = outcome;
+                }
+            });
+
+        scheduler.execute(tasks);
+
+        let mut rows = Vec::new();
+        if let Ok(mut guard) = results.lock() {
+            for outcome in guard.iter_mut() {
+                total_input += outcome.input_rows;
+                total_output += outcome.output_rows;
+                if outcome.skew {
+                    skew_detected = true;
+                }
+                if !outcome.rows.is_empty() {
+                    rows.append(&mut outcome.rows);
+                }
+            }
+        }
+
+        self.record_scan_stats(total_input, total_output, partition_count, skew_detected);
+        Ok(Some(QueryResult::Rows {
+            columns: output_columns,
+            rows,
+        }))
+    }
+    fn prepare_batch_predicate(
+        &self,
+        table: &Table,
+        predicate: &Predicate,
+        cte_tables: &HashMap<String, Table>,
+    ) -> Result<execution::BatchPredicate, SqlDatabaseError> {
+        use execution::BatchPredicate;
+        match predicate {
+            Predicate::Equals { column, value } => {
+                let idx = self.column_index(table, column)?;
+                let column_type = table.columns[idx].ty;
+                let coerced = coerce_static_value(value, column_type)?;
+                Ok(BatchPredicate::Equals {
+                    column_index: idx,
+                    value: coerced,
+                })
+            }
+            Predicate::Between { column, start, end } => {
+                use std::cmp::Ordering;
+                let idx = self.column_index(table, column)?;
+                let column_type = table.columns[idx].ty;
+                let start_val = coerce_static_value(start, column_type)?;
+                let end_val = coerce_static_value(end, column_type)?;
+                let (low, high) = match compare_values(&start_val, &end_val) {
+                    Some(Ordering::Greater) => (end_val, start_val),
+                    _ => (start_val, end_val),
+                };
+                Ok(BatchPredicate::Between {
+                    column_index: idx,
+                    low,
+                    high,
+                })
+            }
+            Predicate::IsNull { column } => {
+                let idx = self.column_index(table, column)?;
+                Ok(BatchPredicate::IsNull { column_index: idx })
+            }
+            Predicate::InTableColumn {
+                column,
+                table: other_table,
+                table_column,
+            } => {
+                let idx = self.column_index(table, column)?;
+                let lookup_table = if let Some(cte_table) = cte_tables.get(other_table) {
+                    cte_table
+                } else if let Some(base) = self.tables.get(other_table) {
+                    base
+                } else if let Some(system) = self.system_tables.get(other_table) {
+                    system
+                } else {
+                    return Err(SqlDatabaseError::UnknownTable(other_table.clone()));
+                };
+                let other_idx = lookup_table
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(table_column))
+                    .ok_or_else(|| SqlDatabaseError::UnknownColumn(table_column.clone()))?;
+                let lookup_values = lookup_table
+                    .rows
+                    .iter()
+                    .map(|row| row[other_idx].clone())
+                    .collect();
+                Ok(BatchPredicate::InTableColumn {
+                    column_index: idx,
+                    lookup_values,
+                })
+            }
+            Predicate::FullText {
+                column,
+                query,
+                language,
+            } => {
+                let idx = self.column_index(table, column)?;
+                if table.columns[idx].ty != ColumnType::Text {
+                    return Err(SqlDatabaseError::SchemaMismatch(format!(
+                        "column '{column}' must be TEXT for full-text search"
+                    )));
+                }
+                Ok(BatchPredicate::FullText {
+                    column_index: idx,
+                    query: query.clone(),
+                    language: language.clone(),
+                })
+            }
+        }
+    }
+
     fn materialize_ctes(
         &self,
         ctes: &[CommonTableExpression],
+        mode: ExecutionMode,
     ) -> Result<HashMap<String, Table>, SqlDatabaseError> {
         let mut tables = HashMap::new();
         for cte in ctes {
@@ -923,14 +1414,14 @@ impl SqlDatabase {
             }
             let table = match &cte.body {
                 CteBody::NonRecursive(select) => {
-                    let result = self.exec_select_statement(&tables, select)?;
+                    let result = self.exec_select_statement(&tables, select, mode)?;
                     match result {
                         QueryResult::Rows { columns, rows } => table_from_rows(columns, rows),
                         _ => return Err(SqlDatabaseError::Unsupported),
                     }
                 }
                 CteBody::Recursive { anchor, recursive } => {
-                    let anchor_result = self.exec_select_statement(&tables, anchor)?;
+                    let anchor_result = self.exec_select_statement(&tables, anchor, mode)?;
                     let (anchor_columns, anchor_rows) = match anchor_result {
                         QueryResult::Rows { columns, rows } => (columns, rows),
                         _ => return Err(SqlDatabaseError::Unsupported),
@@ -945,7 +1436,8 @@ impl SqlDatabase {
                     loop {
                         let mut context = tables.clone();
                         context.insert(cte.name.clone(), working_table.clone());
-                        let recursive_result = self.exec_select_statement(&context, recursive)?;
+                        let recursive_result =
+                            self.exec_select_statement(&context, recursive, mode)?;
                         let (rec_columns, rec_rows) = match recursive_result {
                             QueryResult::Rows { columns, rows } => (columns, rows),
                             _ => return Err(SqlDatabaseError::Unsupported),
@@ -1195,7 +1687,7 @@ impl SqlDatabase {
         ctes: Vec<CommonTableExpression>,
         merge: MergeStatement,
     ) -> Result<QueryResult, SqlDatabaseError> {
-        let cte_tables = self.materialize_ctes(&ctes)?;
+        let cte_tables = self.materialize_ctes(&ctes, ExecutionMode::Auto)?;
 
         let clone_table = |table: &Table| {
             let mut clone = Table {
@@ -2708,7 +3200,7 @@ fn parse_merge_value<'a>(
     ))
 }
 
-fn column_index_in_table(table: &Table, name: &str) -> Result<usize, SqlDatabaseError> {
+pub(crate) fn column_index_in_table(table: &Table, name: &str) -> Result<usize, SqlDatabaseError> {
     table
         .columns
         .iter()
@@ -3286,7 +3778,7 @@ fn row_signature(row: &[Value]) -> String {
     signature
 }
 
-fn full_text_matches(value: &Value, query: &str, language: Option<&str>) -> bool {
+pub(crate) fn full_text_matches(value: &Value, query: &str, language: Option<&str>) -> bool {
     let document = match value {
         Value::Text(text) => text,
         _ => return false,
@@ -3780,7 +4272,7 @@ fn partition_key_string(value: &Value) -> String {
     }
 }
 
-fn compare_values(left: &Value, right: &Value) -> Option<Ordering> {
+pub(crate) fn compare_values(left: &Value, right: &Value) -> Option<Ordering> {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => None,
         (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
@@ -3964,7 +4456,7 @@ pub(crate) fn coerce_static_value(
     coerce_value(value.clone(), target)
 }
 
-fn equal(left: &Value, right: &Value) -> bool {
+pub(crate) fn equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => false,
         (Value::Integer(a), Value::Integer(b)) => a == b,

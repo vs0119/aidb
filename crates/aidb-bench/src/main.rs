@@ -184,6 +184,12 @@ async fn main() {
         println!("Testing batch processing...");
         all_results.extend(advanced_bench::run_batch_processing_benchmarks());
 
+        println!("Testing vectorized execution...");
+        all_results.extend(advanced_bench::run_vectorized_execution_benchmarks());
+
+        println!("Testing parallel execution...");
+        all_results.extend(advanced_bench::run_parallel_execution_benchmarks());
+
         println!("Testing memory efficiency...");
         all_results.extend(advanced_bench::run_memory_efficiency_tests());
 

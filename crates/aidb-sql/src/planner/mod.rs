@@ -16,8 +16,7 @@ pub use cost::{CostEstimate, CostModel};
 pub use logical::{LogicalExpr, LogicalPlan, LogicalPlanBuilder};
 pub use table_ref::{ResolvedTable, TableSource};
 
-#[cfg(test)]
-pub(crate) use logical::ScanCandidates;
+pub(crate) use logical::{ProjectionExpr, ScanCandidates, ScanExpr};
 
 use crate::SqlDatabaseError;
 

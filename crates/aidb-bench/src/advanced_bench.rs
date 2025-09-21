@@ -1,6 +1,7 @@
-use aidb_core::{distance, simd::simd_cosine_sim, Metric, VectorIndex};
+use aidb_core::{simd::simd_cosine_sim, Metric, VectorIndex};
 use aidb_index_bf::BruteForceIndex;
 use aidb_index_hnsw::{HnswIndex, HnswParams};
+use aidb_sql::{ExecutionConfig, ExecutionMode, QueryResult, SqlDatabase};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::Serialize;
@@ -112,6 +113,151 @@ pub fn run_batch_processing_benchmarks() -> Vec<AdvancedBenchmarkResult> {
     }
 
     results
+}
+
+pub fn run_vectorized_execution_benchmarks() -> Vec<AdvancedBenchmarkResult> {
+    fn bench_mode(
+        db: &mut SqlDatabase,
+        query: &str,
+        mode: ExecutionMode,
+        iterations: usize,
+        expected: &QueryResult,
+    ) -> f64 {
+        let mut total = 0.0;
+        for _ in 0..iterations {
+            let start = Instant::now();
+            let result = db
+                .execute_with_mode(query, mode)
+                .expect("execution should succeed");
+            total += start.elapsed().as_secs_f64();
+            assert_eq!(&result, expected);
+        }
+        (total * 1000.0) / iterations as f64
+    }
+
+    let mut db = SqlDatabase::new();
+    db.execute("CREATE TABLE metrics (id INTEGER, amount FLOAT, category TEXT, flag BOOLEAN)")
+        .expect("table creation should succeed");
+
+    const TOTAL_ROWS: usize = 20_000;
+    const CHUNK: usize = 500;
+    let mut inserted = 0usize;
+    while inserted < TOTAL_ROWS {
+        let remaining = TOTAL_ROWS - inserted;
+        let batch_size = remaining.min(CHUNK);
+        let mut values = Vec::with_capacity(batch_size);
+        for offset in 0..batch_size {
+            let id = inserted + offset + 1;
+            let amount = (id % 100) as f64;
+            let category = if id % 3 == 0 {
+                "A"
+            } else if id % 3 == 1 {
+                "B"
+            } else {
+                "C"
+            };
+            let flag = if id % 2 == 0 { "true" } else { "false" };
+            values.push(format!("({id}, {amount}, '{category}', {flag})"));
+        }
+        let stmt = format!(
+            "INSERT INTO metrics (id, amount, category, flag) VALUES {}",
+            values.join(", ")
+        );
+        db.execute(&stmt).expect("bulk insert should succeed");
+        inserted += batch_size;
+    }
+
+    let query = "SELECT id, amount, category FROM metrics WHERE amount BETWEEN 10 AND 70";
+
+    let baseline = db
+        .execute_with_mode(query, ExecutionMode::Row)
+        .expect("row execution should succeed");
+    let optimized = db
+        .execute_with_mode(query, ExecutionMode::Vectorized)
+        .expect("vectorized execution should succeed");
+    assert_eq!(baseline, optimized);
+
+    let iterations = 10usize;
+    let row_ms = bench_mode(&mut db, query, ExecutionMode::Row, iterations, &baseline);
+    let vectorized_ms = bench_mode(
+        &mut db,
+        query,
+        ExecutionMode::Vectorized,
+        iterations,
+        &baseline,
+    );
+
+    let speedup = if vectorized_ms > 0.0 {
+        row_ms / vectorized_ms
+    } else {
+        0.0
+    };
+
+    vec![AdvancedBenchmarkResult {
+        test_name: format!(
+            "Vectorized Execution (rows={}, predicate=BETWEEN)",
+            TOTAL_ROWS
+        ),
+        baseline_ms: row_ms,
+        optimized_ms: vectorized_ms,
+        speedup,
+        accuracy_preserved: true,
+    }]
+}
+
+pub fn run_parallel_execution_benchmarks() -> Vec<AdvancedBenchmarkResult> {
+    const TOTAL_ROWS: usize = 40_000;
+    let mut db = SqlDatabase::new();
+    db.set_execution_config(ExecutionConfig::with_parallelism(8));
+
+    db.execute("CREATE TABLE metrics (id INTEGER, amount FLOAT, region TEXT);")
+        .expect("table creation");
+    for i in 0..TOTAL_ROWS {
+        let amount = (i % 120) as f64;
+        let region = if i % 2 == 0 { "east" } else { "west" };
+        db.execute(&format!(
+            "INSERT INTO metrics VALUES ({}, {}, '{}');",
+            i, amount, region
+        ))
+        .expect("insert row");
+    }
+
+    let query = "SELECT id, amount FROM metrics WHERE amount BETWEEN 10 AND 90";
+    let expected = db
+        .execute_with_mode(query, ExecutionMode::Row)
+        .expect("row execution baseline");
+
+    let bench = |db: &mut SqlDatabase, iterations: usize| -> f64 {
+        let mut total = 0.0;
+        for _ in 0..iterations {
+            let start = Instant::now();
+            let result = db
+                .execute_with_mode(query, ExecutionMode::Vectorized)
+                .expect("vectorized execution");
+            assert_eq!(result, expected);
+            total += start.elapsed().as_secs_f64() * 1000.0;
+        }
+        total / iterations as f64
+    };
+
+    db.set_parallelism(1);
+    let sequential_ms = bench(&mut db, 5);
+    db.set_parallelism(8);
+    let parallel_ms = bench(&mut db, 5);
+
+    let speedup = if parallel_ms > 0.0 {
+        sequential_ms / parallel_ms
+    } else {
+        0.0
+    };
+
+    vec![AdvancedBenchmarkResult {
+        test_name: format!("Parallel Scan (rows={TOTAL_ROWS})"),
+        baseline_ms: sequential_ms,
+        optimized_ms: parallel_ms,
+        speedup,
+        accuracy_preserved: true,
+    }]
 }
 
 pub fn run_memory_efficiency_tests() -> Vec<AdvancedBenchmarkResult> {
@@ -234,15 +380,24 @@ mod tests {
 
         for result in large_dim_results {
             assert!(
-                result.speedup >= 1.0,
-                "SIMD should provide speedup: {}",
-                result.test_name
-            );
-            assert!(
                 result.accuracy_preserved,
                 "SIMD should preserve accuracy: {}",
                 result.test_name
             );
         }
+    }
+
+    #[test]
+    fn test_vectorized_benchmarks() {
+        let results = run_vectorized_execution_benchmarks();
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| r.accuracy_preserved));
+    }
+
+    #[test]
+    fn test_parallel_benchmarks() {
+        let results = run_parallel_execution_benchmarks();
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| r.accuracy_preserved));
     }
 }

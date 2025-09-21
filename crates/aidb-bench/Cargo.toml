@@ -7,6 +7,7 @@ edition = "2021"
 aidb-core = { path = "../aidb-core" }
 aidb-index-bf = { path = "../aidb-index-bf" }
 aidb-index-hnsw = { path = "../aidb-index-hnsw" }
+aidb-sql = { path = "../aidb-sql" }
 rand.workspace = true
 serde_json.workspace = true
 serde.workspace = true
