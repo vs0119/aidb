@@ -10,4 +10,4 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 roxmltree = "0.19"
-rstar = "0.11"
+rstar = "0.12"
