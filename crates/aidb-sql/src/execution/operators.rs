@@ -199,3 +199,9 @@ pub(crate) fn append_rows(batch: &ColumnarBatch<'_>, output: &mut Vec<Vec<Value>
         output.push(row);
     }
 }
+
+pub(crate) fn collect_rows(batch: &ColumnarBatch<'_>) -> Vec<Vec<Value>> {
+    let mut rows = Vec::new();
+    append_rows(batch, &mut rows);
+    rows
+}

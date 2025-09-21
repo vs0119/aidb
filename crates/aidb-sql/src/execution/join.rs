@@ -1,7 +1,10 @@
 use super::operators::{partition_scan_candidates, ScanPartition};
 use super::scheduler::TaskScheduler;
 use crate::planner::{JoinPredicate, JoinType, ScanCandidates};
-use crate::{canonical_json, column_index_in_table, equal, ExecutionStats, Geometry, Table, Value, SqlDatabaseError};
+use crate::{
+    canonical_json, column_index_in_table, equal, ExecutionStats, Geometry, SqlDatabaseError,
+    Table, Value,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -41,7 +44,10 @@ fn value_hash_key(value: &Value) -> Option<String> {
         Value::Float(f) => Some(format!("f:{:016x}", f.to_bits())),
         Value::Text(s) => Some(format!("s:{s}")),
         Value::Boolean(b) => Some(format!("b:{}", if *b { 1 } else { 0 })),
-        Value::Timestamp(ts) => Some(format!("t:{}", ts.timestamp_nanos_opt().unwrap_or_default())),
+        Value::Timestamp(ts) => Some(format!(
+            "t:{}",
+            ts.timestamp_nanos_opt().unwrap_or_default()
+        )),
         Value::Json(v) => Some(format!("j:{}", canonical_json(v))),
         Value::Jsonb(v) => Some(format!("jb:{}", canonical_json(v))),
         Value::Xml(s) => Some(format!("x:{s}")),
@@ -84,8 +90,7 @@ fn run_hash_partition(
                             } else {
                                 (probe_row, build_row)
                             };
-                            let mut combined =
-                                Vec::with_capacity(left_row.len() + right_row.len());
+                            let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
                             combined.extend(left_row.iter().cloned());
                             combined.extend(right_row.iter().cloned());
                             outcome.rows.push(combined);
@@ -106,8 +111,7 @@ fn run_hash_partition(
                             } else {
                                 (probe_row, build_row)
                             };
-                            let mut combined =
-                                Vec::with_capacity(left_row.len() + right_row.len());
+                            let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
                             combined.extend(left_row.iter().cloned());
                             combined.extend(right_row.iter().cloned());
                             outcome.rows.push(combined);
@@ -146,8 +150,7 @@ fn run_nested_partition(
                         } else {
                             (probe_row, build_row)
                         };
-                        let mut combined =
-                            Vec::with_capacity(left_row.len() + right_row.len());
+                        let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
                         combined.extend(left_row.iter().cloned());
                         combined.extend(right_row.iter().cloned());
                         outcome.rows.push(combined);
@@ -165,8 +168,7 @@ fn run_nested_partition(
                         } else {
                             (probe_row, build_row)
                         };
-                        let mut combined =
-                            Vec::with_capacity(left_row.len() + right_row.len());
+                        let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
                         combined.extend(left_row.iter().cloned());
                         combined.extend(right_row.iter().cloned());
                         outcome.rows.push(combined);
@@ -196,13 +198,12 @@ pub(crate) fn parallel_hash_join(
     let left_column = column_index_in_table(left, &predicate.left_column)?;
     let right_column = column_index_in_table(right, &predicate.right_column)?;
 
-    let (build_table, build_index, probe_table, probe_index, build_is_left) = if left.rows.len()
-        <= right.rows.len()
-    {
-        (left, left_column, right, right_column, true)
-    } else {
-        (right, right_column, left, left_column, false)
-    };
+    let (build_table, build_index, probe_table, probe_index, build_is_left) =
+        if left.rows.len() <= right.rows.len() {
+            (left, left_column, right, right_column, true)
+        } else {
+            (right, right_column, left, left_column, false)
+        };
 
     let mut hash_map: HashMap<String, Vec<usize>> = HashMap::with_capacity(build_table.rows.len());
     for (row_idx, row) in build_table.rows.iter().enumerate() {
@@ -235,7 +236,10 @@ pub(crate) fn parallel_hash_join(
     let hash_map = Arc::new(hash_map);
     let build_ref = TableHandle::new(build_table);
     let probe_ref = TableHandle::new(probe_table);
-    let results_main = Arc::new(Mutex::new(vec![JoinPartitionOutcome::default(); partitions.len()]));
+    let results_main = Arc::new(Mutex::new(vec![
+        JoinPartitionOutcome::default();
+        partitions.len()
+    ]));
 
     if scheduler.is_some() && partitions.len() > 1 {
         let scheduler = scheduler.expect("scheduler required for parallel execution");
