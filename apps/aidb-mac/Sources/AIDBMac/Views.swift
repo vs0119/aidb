@@ -46,6 +46,12 @@ struct SidebarView: View {
                         .font(.subheadline.weight(.medium))
                 }
                 .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+
+                NavigationLink(destination: CostEstimationView().environmentObject(model)) {
+                    Label("Cost Estimation", systemImage: "speedometer")
+                        .font(.subheadline.weight(.medium))
+                }
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
             } header: {
                 Label("Analytics", systemImage: "chart.line.uptrend.xyaxis")
                     .font(.subheadline.weight(.medium))
@@ -2880,5 +2886,623 @@ struct StatsCardView: View {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(color.opacity(0.2), lineWidth: 1)
         )
+    }
+}
+
+// MARK: - Cost Estimation Views
+
+struct CostEstimationView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var selectedTab = 0
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Cost Estimation")
+                            .font(.largeTitle.weight(.bold))
+                        Text("Query optimization and cardinality estimation")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        Task {
+                            await fetchCostData()
+                        }
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(model.isEstimatingCost)
+                }
+            }
+            .padding()
+
+            TabView(selection: $selectedTab) {
+                CardinalityEstimatorView()
+                    .environmentObject(model)
+                    .tabItem {
+                        Label("Cardinality", systemImage: "chart.line.uptrend.xyaxis")
+                    }
+                    .tag(0)
+
+                QueryPlanAnalyzerView()
+                    .environmentObject(model)
+                    .tabItem {
+                        Label("Query Plans", systemImage: "list.bullet.rectangle.portrait")
+                    }
+                    .tag(1)
+
+                CostModelConfigView()
+                    .environmentObject(model)
+                    .tabItem {
+                        Label("Configuration", systemImage: "gear")
+                    }
+                    .tag(2)
+            }
+        }
+        .task {
+            await fetchCostData()
+        }
+    }
+
+    private func fetchCostData() async {
+        do {
+            model.isEstimatingCost = true
+            model.queryPlans = try await model.client.getQueryPlans()
+        } catch {
+            await model.report(error)
+        }
+        model.isEstimatingCost = false
+    }
+}
+
+struct CardinalityEstimatorView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var selectedTable = ""
+    @State private var predicateText = ""
+    @State private var estimatedCardinality: CardinalityEstimate?
+    @State private var isEstimating = false
+
+    var body: some View {
+        VStack(spacing: 20) {
+            // Cardinality Estimation Form
+            GroupBox {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Estimate Cardinality")
+                        .font(.headline.weight(.semibold))
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Table")
+                            .font(.subheadline.weight(.medium))
+
+                        Picker("Select Table", selection: $selectedTable) {
+                            Text("Select a table...").tag("")
+                            ForEach(model.tables, id: \.name) { table in
+                                Text(table.name).tag(table.name)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Predicate (optional)")
+                            .font(.subheadline.weight(.medium))
+
+                        TextField("e.g., age > 25 AND city = 'NYC'", text: $predicateText)
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    HStack {
+                        Button {
+                            Task {
+                                await estimateCardinality()
+                            }
+                        } label: {
+                            HStack {
+                                if isEstimating {
+                                    ProgressView()
+                                        .scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: "function")
+                                }
+                                Text("Estimate")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(selectedTable.isEmpty || isEstimating)
+
+                        Spacer()
+                    }
+                }
+                .padding()
+            }
+
+            // Results
+            if let cardinality = estimatedCardinality {
+                CardinalityResultView(estimate: cardinality)
+            }
+
+            // Existing Estimates
+            if !model.cardinalityEstimates.isEmpty {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Recent Estimates")
+                            .font(.headline.weight(.semibold))
+
+                        LazyVGrid(columns: [
+                            GridItem(.flexible()),
+                            GridItem(.flexible())
+                        ], spacing: 12) {
+                            ForEach(Array(model.cardinalityEstimates.keys.sorted()), id: \.self) { key in
+                                if let estimate = model.cardinalityEstimates[key] {
+                                    CardinalityCardView(tableName: key, estimate: estimate)
+                                }
+                            }
+                        }
+                    }
+                    .padding()
+                }
+            }
+
+            Spacer()
+        }
+        .padding()
+    }
+
+    private func estimateCardinality() async {
+        isEstimating = true
+        defer { isEstimating = false }
+
+        do {
+            let predicate = predicateText.isEmpty ? nil : predicateText
+            let estimate = try await model.client.estimateCardinality(
+                tableName: selectedTable,
+                predicate: predicate
+            )
+
+            await MainActor.run {
+                estimatedCardinality = estimate
+                model.cardinalityEstimates[selectedTable] = estimate
+            }
+        } catch {
+            await model.report(error)
+        }
+    }
+}
+
+struct CardinalityResultView: View {
+    let estimate: CardinalityEstimate
+
+    var body: some View {
+        GroupBox {
+            VStack(spacing: 16) {
+                Text("Cardinality Estimate")
+                    .font(.headline.weight(.semibold))
+
+                HStack(spacing: 24) {
+                    VStack(spacing: 8) {
+                        Text("Estimated Rows")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+
+                        Text(estimate.formattedRows)
+                            .font(.title.weight(.bold))
+                            .foregroundStyle(.primary)
+                    }
+
+                    VStack(spacing: 8) {
+                        Text("Confidence")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+
+                        Text(estimate.confidencePercent)
+                            .font(.title.weight(.bold))
+                            .foregroundStyle(confidenceColor)
+                    }
+                }
+
+                // Confidence indicator
+                HStack {
+                    Text("Low")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    ProgressView(value: estimate.confidence, total: 1.0)
+                        .progressViewStyle(.linear)
+                        .tint(confidenceColor)
+
+                    Text("High")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding()
+        }
+    }
+
+    private var confidenceColor: Color {
+        if estimate.confidence >= 0.7 {
+            return .green
+        } else if estimate.confidence >= 0.4 {
+            return .orange
+        } else {
+            return .red
+        }
+    }
+}
+
+struct CardinalityCardView: View {
+    let tableName: String
+    let estimate: CardinalityEstimate
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(tableName)
+                .font(.subheadline.weight(.medium))
+                .lineLimit(1)
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Rows")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(estimate.formattedRows)
+                        .font(.subheadline.weight(.semibold))
+                }
+
+                Spacer()
+
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("Confidence")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(estimate.confidencePercent)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(estimate.confidence >= 0.5 ? .green : .orange)
+                }
+            }
+        }
+        .padding(12)
+        .background(Color(NSColor.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.gray.opacity(0.2), lineWidth: 1)
+        )
+    }
+}
+
+struct QueryPlanAnalyzerView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var sqlQuery = ""
+    @State private var isAnalyzing = false
+
+    var body: some View {
+        VStack(spacing: 20) {
+            // Query Analyzer Form
+            GroupBox {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Analyze Query Plan")
+                        .font(.headline.weight(.semibold))
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("SQL Query")
+                            .font(.subheadline.weight(.medium))
+
+                        TextEditor(text: $sqlQuery)
+                            .font(.system(.body, design: .monospaced))
+                            .frame(minHeight: 100)
+                            .background(Color(NSColor.textBackgroundColor))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                            )
+                    }
+
+                    HStack {
+                        Button {
+                            Task {
+                                await analyzeQuery()
+                            }
+                        } label: {
+                            HStack {
+                                if isAnalyzing {
+                                    ProgressView()
+                                        .scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: "magnifyingglass")
+                                }
+                                Text("Analyze Plan")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(sqlQuery.isEmpty || isAnalyzing)
+
+                        Spacer()
+                    }
+                }
+                .padding()
+            }
+
+            // Query Plans List
+            if !model.queryPlans.isEmpty {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Query Plans")
+                            .font(.headline.weight(.semibold))
+
+                        List(model.queryPlans) { plan in
+                            QueryPlanRowView(plan: plan)
+                        }
+                        .frame(minHeight: 200)
+                    }
+                    .padding()
+                }
+            }
+
+            Spacer()
+        }
+        .padding()
+    }
+
+    private func analyzeQuery() async {
+        isAnalyzing = true
+        defer { isAnalyzing = false }
+
+        do {
+            let plan = try await model.client.analyzeQueryPlan(sql: sqlQuery)
+            await MainActor.run {
+                model.queryPlans.insert(plan, at: 0)
+                model.selectedQueryPlan = plan
+            }
+        } catch {
+            await model.report(error)
+        }
+    }
+}
+
+struct QueryPlanRowView: View {
+    let plan: QueryPlan
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(plan.table_name)
+                    .font(.headline.weight(.medium))
+
+                Spacer()
+
+                Text(plan.operation_type)
+                    .font(.caption)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.blue.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            }
+
+            // Cost breakdown
+            LazyVGrid(columns: [
+                GridItem(.flexible()),
+                GridItem(.flexible()),
+                GridItem(.flexible()),
+                GridItem(.flexible())
+            ], spacing: 12) {
+                CostMetricView(
+                    label: "Total Cost",
+                    value: plan.estimated_cost.formattedTotalCost,
+                    color: .primary
+                )
+
+                CostMetricView(
+                    label: "CPU Cost",
+                    value: plan.estimated_cost.formattedCpuCost,
+                    color: .blue
+                )
+
+                CostMetricView(
+                    label: "I/O Cost",
+                    value: plan.estimated_cost.formattedIoCost,
+                    color: .orange
+                )
+
+                CostMetricView(
+                    label: "Est. Rows",
+                    value: plan.estimated_cost.cardinality.formattedRows,
+                    color: .green
+                )
+            }
+
+            // Plan statistics
+            HStack {
+                Text("Row Width: \(plan.plan_statistics.formattedRowWidth)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Text(plan.formattedCreatedAt)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 8)
+    }
+}
+
+struct CostMetricView: View {
+    let label: String
+    let value: String
+    let color: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text(value)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(color)
+        }
+    }
+}
+
+struct CostModelConfigView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var pageSize: Double = 8192
+    @State private var cpuCostPerRow: Double = 1.0
+    @State private var isUpdating = false
+
+    var body: some View {
+        VStack(spacing: 20) {
+            GroupBox {
+                VStack(alignment: .leading, spacing: 20) {
+                    Text("Cost Model Configuration")
+                        .font(.headline.weight(.semibold))
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Page Size (bytes)")
+                            .font(.subheadline.weight(.medium))
+
+                        HStack {
+                            Slider(value: $pageSize, in: 1024...65536, step: 1024) {
+                                Text("Page Size")
+                            }
+
+                            Text("\(Int(pageSize))")
+                                .font(.system(.body, design: .monospaced))
+                                .frame(width: 60, alignment: .trailing)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("CPU Cost per Row")
+                            .font(.subheadline.weight(.medium))
+
+                        HStack {
+                            Slider(value: $cpuCostPerRow, in: 0.1...10.0, step: 0.1) {
+                                Text("CPU Cost")
+                            }
+
+                            Text(String(format: "%.1f", cpuCostPerRow))
+                                .font(.system(.body, design: .monospaced))
+                                .frame(width: 40, alignment: .trailing)
+                        }
+                    }
+
+                    HStack {
+                        Button {
+                            Task {
+                                await updateCostModel()
+                            }
+                        } label: {
+                            HStack {
+                                if isUpdating {
+                                    ProgressView()
+                                        .scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: "gear")
+                                }
+                                Text("Update Model")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isUpdating)
+
+                        Button {
+                            resetToDefaults()
+                        } label: {
+                            Text("Reset to Defaults")
+                        }
+                        .buttonStyle(.bordered)
+
+                        Spacer()
+                    }
+                }
+                .padding()
+            }
+
+            // Current configuration display
+            GroupBox {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Current Configuration")
+                        .font(.headline.weight(.semibold))
+
+                    LazyVGrid(columns: [
+                        GridItem(.flexible()),
+                        GridItem(.flexible())
+                    ], spacing: 16) {
+                        ConfigItemView(
+                            label: "Page Size",
+                            value: "\(Int(model.costModelConfig.page_size_bytes)) bytes"
+                        )
+
+                        ConfigItemView(
+                            label: "CPU Cost/Row",
+                            value: String(format: "%.1f", model.costModelConfig.cpu_cost_per_row)
+                        )
+                    }
+                }
+                .padding()
+            }
+
+            Spacer()
+        }
+        .padding()
+        .onAppear {
+            pageSize = model.costModelConfig.page_size_bytes
+            cpuCostPerRow = model.costModelConfig.cpu_cost_per_row
+        }
+    }
+
+    private func updateCostModel() async {
+        isUpdating = true
+        defer { isUpdating = false }
+
+        let newConfig = CostModelConfig(
+            page_size_bytes: pageSize,
+            cpu_cost_per_row: cpuCostPerRow
+        )
+
+        do {
+            let success = try await model.client.updateCostModel(config: newConfig)
+            if success {
+                await MainActor.run {
+                    model.costModelConfig = newConfig
+                }
+            }
+        } catch {
+            await model.report(error)
+        }
+    }
+
+    private func resetToDefaults() {
+        pageSize = CostModelConfig.default.page_size_bytes
+        cpuCostPerRow = CostModelConfig.default.cpu_cost_per_row
+    }
+}
+
+struct ConfigItemView: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text(value)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+        }
+        .padding(12)
+        .background(Color(NSColor.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }

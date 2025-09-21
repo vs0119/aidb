@@ -306,6 +306,13 @@ final class AppModel: ObservableObject {
     @Published var selectedTableStats: TableStatistics?
     @Published var isAnalyzing = false
 
+    // Cost Estimation
+    @Published var queryPlans: [QueryPlan] = []
+    @Published var selectedQueryPlan: QueryPlan?
+    @Published var costModelConfig: CostModelConfig = .default
+    @Published var isEstimatingCost = false
+    @Published var cardinalityEstimates: [String: CardinalityEstimate] = [:]
+
     let client = AIDBClient()
 
     private let defaults = UserDefaults.standard
@@ -651,4 +658,139 @@ struct StatisticsSummary: Codable, Hashable {
     let total_columns: Int
     let analyzed_columns: Int
     let active_refresh_jobs: Int
+}
+
+// MARK: - Cost Estimation Models
+
+struct CardinalityEstimate: Codable, Hashable {
+    let estimated_rows: Double
+    let confidence: Double
+
+    var formattedRows: String {
+        if estimated_rows >= 1_000_000 {
+            return String(format: "%.1fM", estimated_rows / 1_000_000)
+        } else if estimated_rows >= 1_000 {
+            return String(format: "%.1fK", estimated_rows / 1_000)
+        } else {
+            return String(format: "%.0f", estimated_rows)
+        }
+    }
+
+    var confidencePercent: String {
+        return String(format: "%.1f%%", confidence * 100)
+    }
+}
+
+struct CostEstimate: Codable, Hashable {
+    let cardinality: CardinalityEstimate
+    let cpu_cost: Double
+    let io_cost: Double
+
+    var total_cost: Double {
+        cpu_cost + io_cost
+    }
+
+    var formattedTotalCost: String {
+        return String(format: "%.2f", total_cost)
+    }
+
+    var formattedCpuCost: String {
+        return String(format: "%.2f", cpu_cost)
+    }
+
+    var formattedIoCost: String {
+        return String(format: "%.2f", io_cost)
+    }
+}
+
+struct PlanStatistics: Codable, Hashable {
+    let observed_row_count: UInt64
+    let average_row_width: Double
+    let has_table_stats: Bool
+    let column_count: Int
+
+    var formattedRowWidth: String {
+        return String(format: "%.1f bytes", average_row_width)
+    }
+}
+
+enum JoinType: String, Codable, CaseIterable {
+    case inner = "Inner"
+
+    var displayName: String {
+        switch self {
+        case .inner: return "Inner Join"
+        }
+    }
+}
+
+struct JoinPredicate: Codable, Hashable {
+    let left_column: String
+    let right_column: String
+    let join_type: JoinType
+}
+
+enum PredicateType: String, Codable, CaseIterable {
+    case equals = "Equals"
+    case between = "Between"
+    case isNull = "IsNull"
+    case inTableColumn = "InTableColumn"
+    case fullText = "FullText"
+
+    var displayName: String {
+        switch self {
+        case .equals: return "Equals"
+        case .between: return "Between"
+        case .isNull: return "Is Null"
+        case .inTableColumn: return "In Subquery"
+        case .fullText: return "Full Text"
+        }
+    }
+}
+
+struct PredicateEstimate: Codable, Hashable {
+    let predicate_type: PredicateType
+    let column_name: String
+    let selectivity: Double
+    let confidence: Double
+
+    var formattedSelectivity: String {
+        return String(format: "%.1f%%", selectivity * 100)
+    }
+
+    var formattedConfidence: String {
+        return String(format: "%.1f%%", confidence * 100)
+    }
+}
+
+struct CostModelConfig: Codable, Hashable {
+    let page_size_bytes: Double
+    let cpu_cost_per_row: Double
+
+    static let `default` = CostModelConfig(
+        page_size_bytes: 8192.0,
+        cpu_cost_per_row: 1.0
+    )
+}
+
+struct QueryPlan: Codable, Hashable, Identifiable {
+    let id: String
+    let table_name: String
+    let operation_type: String
+    let estimated_cost: CostEstimate
+    let plan_statistics: PlanStatistics
+    let predicates: [PredicateEstimate]
+    let created_at: String
+
+    var formattedCreatedAt: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .medium
+
+        let isoFormatter = ISO8601DateFormatter()
+        if let date = isoFormatter.date(from: created_at) {
+            return formatter.string(from: date)
+        }
+        return created_at
+    }
 }

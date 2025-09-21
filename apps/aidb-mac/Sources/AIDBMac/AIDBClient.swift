@@ -317,4 +317,132 @@ final class AIDBClient {
             return StatisticsValue(type: .text, value: AnyCodable(str))
         }
     }
+
+    // MARK: - Cost Estimation Interface
+
+    func estimateCardinality(tableName: String, predicate: String?) async throws -> CardinalityEstimate {
+        let url = baseURL.appending(path: "/cost/cardinality")
+        var r = URLRequest(url: url)
+        r.httpMethod = "POST"
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: Any] = [
+            "table_name": tableName,
+            "predicate": predicate as Any
+        ]
+        r.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (d, response) = try await session.data(for: r)
+
+        if let httpResponse = response as? HTTPURLResponse,
+           httpResponse.statusCode >= 400 {
+            let errorText = String(data: d, encoding: .utf8) ?? "Unknown error"
+            throw NSError(domain: "AIDBClient", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errorText])
+        }
+
+        return try JSONDecoder().decode(CardinalityEstimate.self, from: d)
+    }
+
+    func estimateQueryCost(tableName: String, queryType: String, predicate: String?) async throws -> CostEstimate {
+        let url = baseURL.appending(path: "/cost/query")
+        var r = URLRequest(url: url)
+        r.httpMethod = "POST"
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: Any] = [
+            "table_name": tableName,
+            "query_type": queryType,
+            "predicate": predicate as Any
+        ]
+        r.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (d, response) = try await session.data(for: r)
+
+        if let httpResponse = response as? HTTPURLResponse,
+           httpResponse.statusCode >= 400 {
+            let errorText = String(data: d, encoding: .utf8) ?? "Unknown error"
+            throw NSError(domain: "AIDBClient", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errorText])
+        }
+
+        return try JSONDecoder().decode(CostEstimate.self, from: d)
+    }
+
+    func estimateJoinCost(leftTable: String, rightTable: String, joinPredicate: JoinPredicate) async throws -> CostEstimate {
+        let url = baseURL.appending(path: "/cost/join")
+        var r = URLRequest(url: url)
+        r.httpMethod = "POST"
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: Any] = [
+            "left_table": leftTable,
+            "right_table": rightTable,
+            "join_predicate": try JSONEncoder().encode(joinPredicate).base64EncodedString()
+        ]
+        r.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (d, response) = try await session.data(for: r)
+
+        if let httpResponse = response as? HTTPURLResponse,
+           httpResponse.statusCode >= 400 {
+            let errorText = String(data: d, encoding: .utf8) ?? "Unknown error"
+            throw NSError(domain: "AIDBClient", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errorText])
+        }
+
+        return try JSONDecoder().decode(CostEstimate.self, from: d)
+    }
+
+    func analyzeQueryPlan(sql: String) async throws -> QueryPlan {
+        let url = baseURL.appending(path: "/cost/analyze")
+        var r = URLRequest(url: url)
+        r.httpMethod = "POST"
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body = ["sql": sql]
+        r.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (d, response) = try await session.data(for: r)
+
+        if let httpResponse = response as? HTTPURLResponse,
+           httpResponse.statusCode >= 400 {
+            let errorText = String(data: d, encoding: .utf8) ?? "Unknown error"
+            throw NSError(domain: "AIDBClient", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errorText])
+        }
+
+        return try JSONDecoder().decode(QueryPlan.self, from: d)
+    }
+
+    func updateCostModel(config: CostModelConfig) async throws -> Bool {
+        let url = baseURL.appending(path: "/cost/config")
+        var r = URLRequest(url: url)
+        r.httpMethod = "POST"
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        r.httpBody = try JSONEncoder().encode(config)
+
+        let (d, response) = try await session.data(for: r)
+
+        if let httpResponse = response as? HTTPURLResponse,
+           httpResponse.statusCode >= 400 {
+            let errorText = String(data: d, encoding: .utf8) ?? "Unknown error"
+            throw NSError(domain: "AIDBClient", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errorText])
+        }
+
+        return try JSONDecoder().decode(Bool.self, from: d)
+    }
+
+    func getQueryPlans(tableName: String? = nil) async throws -> [QueryPlan] {
+        var url = baseURL.appending(path: "/cost/plans")
+        if let tableName = tableName {
+            url.append(queryItems: [URLQueryItem(name: "table", value: tableName)])
+        }
+
+        let (d, response) = try await session.data(from: url)
+
+        if let httpResponse = response as? HTTPURLResponse,
+           httpResponse.statusCode >= 400 {
+            let errorText = String(data: d, encoding: .utf8) ?? "Unknown error"
+            throw NSError(domain: "AIDBClient", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errorText])
+        }
+
+        return try JSONDecoder().decode([QueryPlan].self, from: d)
+    }
 }
