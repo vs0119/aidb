@@ -316,14 +316,58 @@ pub struct CacheStats {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PlanCacheKey {
     shape: String,
-    params: Vec<String>,
+    params_fingerprint: String,
+}
+
+impl PlanCacheKey {
+    fn new(shape: String, params: Vec<String>) -> Self {
+        Self {
+            shape,
+            params_fingerprint: Self::normalize_params(params),
+        }
+    }
+
+    fn normalize_params(params: Vec<String>) -> String {
+        if params.is_empty() {
+            return String::new();
+        }
+        let mut fingerprint = String::new();
+        use std::fmt::Write;
+        for param in params {
+            let _ = write!(fingerprint, "{:08x}:{param};", param.len());
+        }
+        fingerprint
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedBatchSlice {
+    start: usize,
+    len: usize,
 }
 
 #[derive(Debug, Clone)]
 struct CachedSelectResult {
     result: QueryResult,
     #[allow(dead_code)]
-    matching_indices: Vec<usize>,
+    matching_indices: Option<Vec<usize>>,
+    #[allow(dead_code)]
+    batch_slices: Option<Vec<CachedBatchSlice>>,
+}
+
+#[derive(Debug, Clone)]
+struct VectorizedSelectResult {
+    result: QueryResult,
+    batch_slices: Vec<CachedBatchSlice>,
+}
+
+#[derive(Debug, Clone)]
+enum SelectExecutionOutcome {
+    Row {
+        result: QueryResult,
+        matching_indices: Vec<usize>,
+    },
+    Vectorized(VectorizedSelectResult),
 }
 
 #[derive(Debug, Clone)]
@@ -478,7 +522,10 @@ impl SqlDatabase {
     }
 
     pub fn last_execution_stats(&self) -> ExecutionStats {
-        self.execution_stats.lock().map(|s| s.clone()).unwrap_or_default()
+        self.execution_stats
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
     }
 
     pub fn set_parallelism(&mut self, parallelism: usize) {
@@ -1016,24 +1063,66 @@ impl SqlDatabase {
             ExecutionMode::Row => None,
         };
 
-        match mode {
+        let outcome = match mode {
             ExecutionMode::Auto => {
                 if let Some(result) = vectorized_result {
-                    Ok(result)
+                    SelectExecutionOutcome::Vectorized(result)
                 } else {
-                    self.execute_select_plan_row(projection, predicate, scan, cte_tables)
+                    let (result, matching_indices) =
+                        self.execute_select_plan_row(projection, predicate, scan, cte_tables)?;
+                    SelectExecutionOutcome::Row {
+                        result,
+                        matching_indices,
+                    }
                 }
             }
             ExecutionMode::Vectorized => {
                 if let Some(result) = vectorized_result {
-                    Ok(result)
+                    SelectExecutionOutcome::Vectorized(result)
                 } else {
-                    Err(SqlDatabaseError::Unsupported)
+                    return Err(SqlDatabaseError::Unsupported);
                 }
             }
             ExecutionMode::Row => {
-                self.execute_select_plan_row(projection, predicate, scan, cte_tables)
+                let (result, matching_indices) =
+                    self.execute_select_plan_row(projection, predicate, scan, cte_tables)?;
+                SelectExecutionOutcome::Row {
+                    result,
+                    matching_indices,
+                }
             }
+        };
+
+        let cache_entry = if cache_metadata.is_some() {
+            Some(match &outcome {
+                SelectExecutionOutcome::Row {
+                    result,
+                    matching_indices,
+                } => CachedSelectResult {
+                    result: result.clone(),
+                    matching_indices: Some(matching_indices.clone()),
+                    batch_slices: None,
+                },
+                SelectExecutionOutcome::Vectorized(vectorized) => CachedSelectResult {
+                    result: vectorized.result.clone(),
+                    matching_indices: None,
+                    batch_slices: Some(vectorized.batch_slices.clone()),
+                },
+            })
+        } else {
+            None
+        };
+
+        if let Some(metadata) = cache_metadata {
+            if let Some(entry) = cache_entry {
+                self.plan_cache_stats.borrow_mut().misses += 1;
+                self.store_plan_cache(metadata, entry);
+            }
+        }
+
+        match outcome {
+            SelectExecutionOutcome::Row { result, .. } => Ok(result),
+            SelectExecutionOutcome::Vectorized(vectorized) => Ok(vectorized.result),
         }
     }
 
@@ -1043,7 +1132,7 @@ impl SqlDatabase {
         predicate: Option<&Predicate>,
         scan: &planner::ScanExpr,
         cte_tables: &HashMap<String, Table>,
-    ) -> Result<QueryResult, SqlDatabaseError> {
+    ) -> Result<(QueryResult, Vec<usize>), SqlDatabaseError> {
         let table = scan.table.table;
         let iter: Box<dyn Iterator<Item = usize>> = match scan.candidates.as_slice() {
             Some(rows) => Box::new(rows.iter().copied()),
@@ -1136,12 +1225,7 @@ impl SqlDatabase {
             }
         };
 
-        if let Some(metadata) = cache_metadata {
-            self.plan_cache_stats.borrow_mut().misses += 1;
-            self.store_plan_cache(metadata, matching_indices, result.clone());
-        }
-
-        Ok(result)
+        Ok((result, matching_indices))
     }
 
     fn try_vectorized_select(
@@ -1150,8 +1234,10 @@ impl SqlDatabase {
         predicate: Option<&Predicate>,
         scan: &planner::ScanExpr,
         cte_tables: &HashMap<String, Table>,
-    ) -> Result<Option<QueryResult>, SqlDatabaseError> {
-        use execution::{append_rows, apply_predicate, build_batch_for_partition, partition_scan_candidates};
+    ) -> Result<Option<VectorizedSelectResult>, SqlDatabaseError> {
+        use execution::{
+            apply_predicate, build_batch_for_partition, collect_rows, partition_scan_candidates,
+        };
 
         #[derive(Default)]
         struct PartitionOutcome {
@@ -1216,6 +1302,7 @@ impl SqlDatabase {
 
         if !use_parallel {
             let mut rows = Vec::new();
+            let mut batch_slices = Vec::new();
             let column_types: Vec<ColumnType> = table.columns.iter().map(|c| c.ty).collect();
             for partition in &partitions {
                 let mut batch = build_batch_for_partition(table, &column_types, partition);
@@ -1236,12 +1323,22 @@ impl SqlDatabase {
                     continue;
                 }
                 let projected = batch.project(&projection_indices);
-                append_rows(&projected, &mut rows);
+                let mut partition_rows = collect_rows(&projected);
+                if partition_rows.is_empty() {
+                    continue;
+                }
+                let start = rows.len();
+                let len = partition_rows.len();
+                rows.append(&mut partition_rows);
+                batch_slices.push(CachedBatchSlice { start, len });
             }
             self.record_scan_stats(total_input, total_output, partition_count, skew_detected);
-            return Ok(Some(QueryResult::Rows {
-                columns: output_columns,
-                rows,
+            return Ok(Some(VectorizedSelectResult {
+                result: QueryResult::Rows {
+                    columns: output_columns,
+                    rows,
+                },
+                batch_slices,
             }));
         }
 
@@ -1249,50 +1346,52 @@ impl SqlDatabase {
         let column_types = Arc::new(column_types);
         let projection = Arc::new(projection_indices.clone());
         let predicate = prepared_predicate.clone();
-        let results = Arc::new(Mutex::new(vec![PartitionOutcome::default(); partition_count]));
+        let results = Arc::new(Mutex::new(vec![
+            PartitionOutcome::default();
+            partition_count
+        ]));
         let threshold_arc = Arc::new(threshold);
         let table_handle = TableHandle::new(table);
 
         let scheduler = self.scheduler.as_ref().expect("scheduler not initialized");
-        let tasks = partitions
-            .into_iter()
-            .enumerate()
-            .map(|(idx, partition)| {
-                let column_types = Arc::clone(&column_types);
-                let projection = Arc::clone(&projection);
-                let results = Arc::clone(&results);
-                let predicate = predicate.clone();
-                let threshold = Arc::clone(&threshold_arc);
-                move || {
-                    let table_ref = unsafe { table_handle.get() };
-                    let mut batch = build_batch_for_partition(table_ref, column_types.as_slice(), &partition);
-                    let mut outcome = PartitionOutcome {
-                        rows: Vec::new(),
-                        input_rows: batch.len(),
-                        output_rows: 0,
-                        skew: batch.len() >= *threshold,
-                    };
-                    if let Some(prepared) = predicate.as_ref() {
-                        apply_predicate(&mut batch, prepared);
-                        if batch.is_empty() {
-                            let mut guard = results.lock().unwrap();
-                            guard[idx] = outcome;
-                            return;
-                        }
+        let tasks = partitions.into_iter().enumerate().map(|(idx, partition)| {
+            let column_types = Arc::clone(&column_types);
+            let projection = Arc::clone(&projection);
+            let results = Arc::clone(&results);
+            let predicate = predicate.clone();
+            let threshold = Arc::clone(&threshold_arc);
+            move || {
+                let table_ref = unsafe { table_handle.get() };
+                let mut batch =
+                    build_batch_for_partition(table_ref, column_types.as_slice(), &partition);
+                let mut outcome = PartitionOutcome {
+                    rows: Vec::new(),
+                    input_rows: batch.len(),
+                    output_rows: 0,
+                    skew: batch.len() >= *threshold,
+                };
+                if let Some(prepared) = predicate.as_ref() {
+                    apply_predicate(&mut batch, prepared);
+                    if batch.is_empty() {
+                        let mut guard = results.lock().unwrap();
+                        guard[idx] = outcome;
+                        return;
                     }
-                    outcome.output_rows = batch.len();
-                    if outcome.output_rows > 0 {
-                        let projected = batch.project(projection.as_slice());
-                        append_rows(&projected, &mut outcome.rows);
-                    }
-                    let mut guard = results.lock().unwrap();
-                    guard[idx] = outcome;
                 }
-            });
+                outcome.output_rows = batch.len();
+                if outcome.output_rows > 0 {
+                    let projected = batch.project(projection.as_slice());
+                    outcome.rows = collect_rows(&projected);
+                }
+                let mut guard = results.lock().unwrap();
+                guard[idx] = outcome;
+            }
+        });
 
         scheduler.execute(tasks);
 
         let mut rows = Vec::new();
+        let mut batch_slices = Vec::new();
         if let Ok(mut guard) = results.lock() {
             for outcome in guard.iter_mut() {
                 total_input += outcome.input_rows;
@@ -1301,15 +1400,21 @@ impl SqlDatabase {
                     skew_detected = true;
                 }
                 if !outcome.rows.is_empty() {
+                    let start = rows.len();
+                    let len = outcome.rows.len();
                     rows.append(&mut outcome.rows);
+                    batch_slices.push(CachedBatchSlice { start, len });
                 }
             }
         }
 
         self.record_scan_stats(total_input, total_output, partition_count, skew_detected);
-        Ok(Some(QueryResult::Rows {
-            columns: output_columns,
-            rows,
+        Ok(Some(VectorizedSelectResult {
+            result: QueryResult::Rows {
+                columns: output_columns,
+                rows,
+            },
+            batch_slices,
         }))
     }
     fn prepare_batch_predicate(
@@ -1473,25 +1578,14 @@ impl SqlDatabase {
         Ok(tables)
     }
 
-    fn store_plan_cache(
-        &self,
-        metadata: PlanCacheMetadata,
-        matching_indices: Vec<usize>,
-        result: QueryResult,
-    ) {
+    fn store_plan_cache(&self, metadata: PlanCacheMetadata, entry: CachedSelectResult) {
         let PlanCacheMetadata {
             key,
             dependent_tables,
         } = metadata;
         {
             let mut cache = self.plan_cache.borrow_mut();
-            cache.insert(
-                key.clone(),
-                CachedSelectResult {
-                    result,
-                    matching_indices,
-                },
-            );
+            cache.insert(key.clone(), entry);
         }
         let mut index = self.plan_cache_index.borrow_mut();
         for table in dependent_tables {
@@ -1529,7 +1623,7 @@ impl SqlDatabase {
         if dependencies.is_empty() {
             return None;
         }
-        let key = PlanCacheKey { shape, params };
+        let key = PlanCacheKey::new(shape, params);
         Some(PlanCacheMetadata {
             key,
             dependent_tables: dependencies,
@@ -5579,6 +5673,56 @@ mod tests {
         let stats_after_third = db.cache_stats();
         assert_eq!(stats_after_third.hits, 1);
         assert_eq!(stats_after_third.misses, stats_after_insert.misses + 1);
+    }
+
+    #[test]
+    fn vectorized_selects_are_cached() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE metrics (id INT, score INT);")
+            .unwrap();
+        db.execute("INSERT INTO metrics VALUES (1, 5), (2, 10), (3, 15), (4, 20);")
+            .unwrap();
+
+        let first = db
+            .execute_with_mode(
+                "SELECT id FROM metrics WHERE score >= 10;",
+                ExecutionMode::Vectorized,
+            )
+            .unwrap();
+        assert_eq!(row_values(&first).len(), 3);
+        let stats_after_first = db.cache_stats();
+        assert_eq!(stats_after_first.misses, 1);
+
+        let second = db
+            .execute_with_mode(
+                "SELECT id FROM metrics WHERE score >= 10;",
+                ExecutionMode::Vectorized,
+            )
+            .unwrap();
+        assert_eq!(second, first);
+        let stats_after_second = db.cache_stats();
+        assert_eq!(stats_after_second.hits, stats_after_first.hits + 1);
+    }
+
+    #[test]
+    fn normalized_plan_signatures_ignore_identifier_case() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE accounts (id INT, name TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO accounts VALUES (1, 'alice');")
+            .unwrap();
+
+        let first = db
+            .execute("SELECT name FROM accounts WHERE id = 1;")
+            .unwrap();
+        assert_eq!(row_values(&first).len(), 1);
+        assert_eq!(db.cache_stats().misses, 1);
+
+        let second = db
+            .execute("select NAME from ACCOUNTS where ID = 1;")
+            .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(db.cache_stats().hits, 1);
     }
 
     #[test]
