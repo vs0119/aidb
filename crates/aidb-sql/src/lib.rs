@@ -43,6 +43,20 @@ enum ColumnType {
     Geometry,
 }
 
+fn column_type_name(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Integer => "INTEGER",
+        ColumnType::Float => "FLOAT",
+        ColumnType::Text => "TEXT",
+        ColumnType::Boolean => "BOOLEAN",
+        ColumnType::Timestamp => "TIMESTAMP",
+        ColumnType::Json => "JSON",
+        ColumnType::Jsonb => "JSONB",
+        ColumnType::Xml => "XML",
+        ColumnType::Geometry => "GEOMETRY",
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Table {
     columns: Vec<Column>,
@@ -67,6 +81,17 @@ impl Default for Table {
             xml_indexes: HashMap::new(),
             spatial_indexes: HashMap::new(),
         }
+    }
+}
+
+impl Table {
+    fn with_columns(columns: Vec<(String, ColumnType)>) -> Self {
+        let mut table = Table::default();
+        for (name, ty) in columns {
+            table.columns.push(Column { name, ty });
+        }
+        initialize_secondary_indexes(&mut table);
+        table
     }
 }
 
@@ -197,10 +222,37 @@ struct PartitioningInfo {
     granularity: PartitionGranularity,
 }
 
+const TABLE_STATS_TABLE: &str = "__aidb_table_stats";
+const COLUMN_STATS_TABLE: &str = "__aidb_column_stats";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableStatistics {
+    pub table_name: String,
+    pub row_count: u64,
+    pub analyzed_at: DateTime<Utc>,
+    pub stats_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnStatistics {
+    pub table_name: String,
+    pub column_name: String,
+    pub data_type: String,
+    pub null_count: u64,
+    pub distinct_count: u64,
+    pub min: Option<Value>,
+    pub max: Option<Value>,
+    pub analyzed_at: DateTime<Utc>,
+    pub stats_version: u32,
+}
+
 #[derive(Debug)]
 pub struct SqlDatabase {
     tables: HashMap<String, Table>,
+    system_tables: HashMap<String, Table>,
     graphs: HashMap<String, Graph>,
+    table_stats_catalog: HashMap<String, TableStatistics>,
+    column_stats_catalog: HashMap<(String, String), ColumnStatistics>,
 }
 
 #[derive(Debug, Error)]
@@ -225,6 +277,8 @@ pub enum SqlDatabaseError {
     NodeExists(String, String),
     #[error("graph '{0}' does not contain node '{1}'")]
     UnknownGraphNode(String, String),
+    #[error("cannot modify system catalog table '{0}'")]
+    SystemTableModification(String),
     #[error("unsupported statement")]
     Unsupported,
 }
@@ -241,10 +295,121 @@ pub enum QueryResult {
 
 impl SqlDatabase {
     pub fn new() -> Self {
-        Self {
+        let mut db = Self {
             tables: HashMap::new(),
+            system_tables: HashMap::new(),
             graphs: HashMap::new(),
+            table_stats_catalog: HashMap::new(),
+            column_stats_catalog: HashMap::new(),
+        };
+        db.initialize_system_catalog();
+        db
+    }
+
+    fn initialize_system_catalog(&mut self) {
+        let table_stats = Table::with_columns(vec![
+            ("table_name".to_string(), ColumnType::Text),
+            ("row_count".to_string(), ColumnType::Integer),
+            ("analyzed_at".to_string(), ColumnType::Timestamp),
+            ("stats_version".to_string(), ColumnType::Integer),
+        ]);
+        let column_stats = Table::with_columns(vec![
+            ("table_name".to_string(), ColumnType::Text),
+            ("column_name".to_string(), ColumnType::Text),
+            ("data_type".to_string(), ColumnType::Text),
+            ("null_count".to_string(), ColumnType::Integer),
+            ("distinct_count".to_string(), ColumnType::Integer),
+            ("min_value".to_string(), ColumnType::Text),
+            ("max_value".to_string(), ColumnType::Text),
+            ("analyzed_at".to_string(), ColumnType::Timestamp),
+            ("stats_version".to_string(), ColumnType::Integer),
+        ]);
+        self.system_tables
+            .insert(TABLE_STATS_TABLE.to_string(), table_stats);
+        self.system_tables
+            .insert(COLUMN_STATS_TABLE.to_string(), column_stats);
+    }
+
+    fn refresh_stats_catalog_tables(&mut self) {
+        if let Some(table) = self.system_tables.get_mut(TABLE_STATS_TABLE) {
+            table.rows.clear();
+            let mut entries: Vec<_> = self.table_stats_catalog.values().cloned().collect();
+            entries.sort_by(|a, b| a.table_name.cmp(&b.table_name));
+            for stat in entries {
+                table.rows.push(vec![
+                    Value::Text(stat.table_name.clone()),
+                    Value::Integer(clamp_u64_to_i64(stat.row_count)),
+                    Value::Timestamp(stat.analyzed_at),
+                    Value::Integer(stat.stats_version as i64),
+                ]);
+            }
         }
+        if let Some(table) = self.system_tables.get_mut(COLUMN_STATS_TABLE) {
+            table.rows.clear();
+            let mut entries: Vec<_> = self.column_stats_catalog.values().cloned().collect();
+            entries.sort_by(|a, b| match a.table_name.cmp(&b.table_name) {
+                Ordering::Equal => a.column_name.cmp(&b.column_name),
+                other => other,
+            });
+            for stat in entries {
+                table.rows.push(vec![
+                    Value::Text(stat.table_name.clone()),
+                    Value::Text(stat.column_name.clone()),
+                    Value::Text(stat.data_type.clone()),
+                    Value::Integer(clamp_u64_to_i64(stat.null_count)),
+                    Value::Integer(clamp_u64_to_i64(stat.distinct_count)),
+                    stat.min
+                        .as_ref()
+                        .map(|v| Value::Text(value_to_plain_string(v)))
+                        .unwrap_or(Value::Null),
+                    stat.max
+                        .as_ref()
+                        .map(|v| Value::Text(value_to_plain_string(v)))
+                        .unwrap_or(Value::Null),
+                    Value::Timestamp(stat.analyzed_at),
+                    Value::Integer(stat.stats_version as i64),
+                ]);
+            }
+        }
+    }
+
+    fn is_system_table(&self, name: &str) -> bool {
+        self.system_tables.contains_key(name)
+    }
+
+    pub fn table_statistics(&self) -> Vec<TableStatistics> {
+        let mut stats: Vec<_> = self.table_stats_catalog.values().cloned().collect();
+        stats.sort_by(|a, b| a.table_name.cmp(&b.table_name));
+        stats
+    }
+
+    pub fn get_table_statistics(&self, table: &str) -> Option<TableStatistics> {
+        self.table_stats_catalog.get(table).cloned()
+    }
+
+    pub fn column_statistics(&self, table: &str) -> Vec<ColumnStatistics> {
+        let mut stats: Vec<_> = self
+            .column_stats_catalog
+            .values()
+            .filter(|stat| stat.table_name == table)
+            .cloned()
+            .collect();
+        stats.sort_by(|a, b| a.column_name.cmp(&b.column_name));
+        stats
+    }
+
+    pub fn get_column_statistics(&self, table: &str, column: &str) -> Option<ColumnStatistics> {
+        let key = (table.to_string(), column.to_string());
+        self.column_stats_catalog.get(&key).cloned()
+    }
+
+    pub fn all_column_statistics(&self) -> Vec<ColumnStatistics> {
+        let mut stats: Vec<_> = self.column_stats_catalog.values().cloned().collect();
+        stats.sort_by(|a, b| match a.table_name.cmp(&b.table_name) {
+            Ordering::Equal => a.column_name.cmp(&b.column_name),
+            other => other,
+        });
+        stats
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, SqlDatabaseError> {
@@ -290,6 +455,10 @@ impl SqlDatabase {
                 self.exec_create_edge(graph, from, to, label, properties)?;
                 Ok(QueryResult::None)
             }
+            Statement::Analyze { table } => {
+                self.exec_analyze(table)?;
+                Ok(QueryResult::None)
+            }
             Statement::MatchGraph {
                 graph,
                 from,
@@ -306,6 +475,9 @@ impl SqlDatabase {
         columns: Vec<(String, ColumnType)>,
         partitioning: Option<PartitioningInfo>,
     ) -> Result<(), SqlDatabaseError> {
+        if self.is_system_table(&name) {
+            return Err(SqlDatabaseError::SystemTableModification(name));
+        }
         if self.tables.contains_key(&name) {
             return Err(SqlDatabaseError::TableExists(name));
         }
@@ -345,6 +517,9 @@ impl SqlDatabase {
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Value>>,
     ) -> Result<usize, SqlDatabaseError> {
+        if self.is_system_table(&table_name) {
+            return Err(SqlDatabaseError::SystemTableModification(table_name));
+        }
         let table = self
             .tables
             .get_mut(&table_name)
@@ -393,6 +568,61 @@ impl SqlDatabase {
         Ok(inserted)
     }
 
+    fn exec_analyze(&mut self, target: Option<String>) -> Result<(), SqlDatabaseError> {
+        let target_tables = if let Some(name) = target {
+            if self.is_system_table(&name) {
+                return Err(SqlDatabaseError::SystemTableModification(name));
+            }
+            if !self.tables.contains_key(&name) {
+                return Err(SqlDatabaseError::UnknownTable(name));
+            }
+            vec![name]
+        } else {
+            self.tables.keys().cloned().collect()
+        };
+
+        for table_name in target_tables {
+            let table = self
+                .tables
+                .get(&table_name)
+                .ok_or_else(|| SqlDatabaseError::UnknownTable(table_name.clone()))?;
+            let analyzed_at = Utc::now();
+            let version = self
+                .table_stats_catalog
+                .get(&table_name)
+                .map(|stat| stat.stats_version + 1)
+                .unwrap_or(1);
+
+            let table_stat = TableStatistics {
+                table_name: table_name.clone(),
+                row_count: table.rows.len() as u64,
+                analyzed_at,
+                stats_version: version,
+            };
+            self.table_stats_catalog
+                .insert(table_name.clone(), table_stat);
+
+            self.column_stats_catalog
+                .retain(|(tbl, _), _| tbl != &table_name);
+
+            for (idx, column) in table.columns.iter().enumerate() {
+                let column_stat = compute_column_statistics(
+                    &table_name,
+                    column,
+                    idx,
+                    &table.rows,
+                    analyzed_at,
+                    version,
+                );
+                self.column_stats_catalog
+                    .insert((table_name.clone(), column.name.clone()), column_stat);
+            }
+        }
+
+        self.refresh_stats_catalog_tables();
+        Ok(())
+    }
+
     fn exec_select(
         &self,
         ctes: Vec<CommonTableExpression>,
@@ -414,17 +644,22 @@ impl SqlDatabase {
                 select.predicate.as_ref(),
                 cte_tables,
             )
-        } else {
-            let table = self
-                .tables
-                .get(&select.table)
-                .ok_or_else(|| SqlDatabaseError::UnknownTable(select.table.clone()))?;
+        } else if let Some(table) = self.tables.get(&select.table) {
             self.exec_select_from_table(
                 table,
                 &select.columns,
                 select.predicate.as_ref(),
                 cte_tables,
             )
+        } else if let Some(table) = self.system_tables.get(&select.table) {
+            self.exec_select_from_table(
+                table,
+                &select.columns,
+                select.predicate.as_ref(),
+                cte_tables,
+            )
+        } else {
+            Err(SqlDatabaseError::UnknownTable(select.table.clone()))
         }
     }
 
@@ -1021,10 +1256,12 @@ impl SqlDatabase {
                 let value = &row[idx];
                 let lookup_table = if let Some(cte_table) = cte_tables.get(other_table) {
                     cte_table
+                } else if let Some(table) = self.tables.get(other_table) {
+                    table
+                } else if let Some(table) = self.system_tables.get(other_table) {
+                    table
                 } else {
-                    self.tables
-                        .get(other_table)
-                        .ok_or_else(|| SqlDatabaseError::UnknownTable(other_table.clone()))?
+                    return Err(SqlDatabaseError::UnknownTable(other_table.clone()));
                 };
                 let other_idx = lookup_table
                     .columns
@@ -1246,6 +1483,9 @@ enum Statement {
         label: Option<String>,
         properties: HashMap<String, Value>,
     },
+    Analyze {
+        table: Option<String>,
+    },
     MatchGraph {
         graph: String,
         from: Option<String>,
@@ -1394,6 +1634,8 @@ fn parse_statement(sql: &str) -> Result<Statement, SqlDatabaseError> {
             ctes: Vec::new(),
             merge,
         })
+    } else if let Some(rest) = strip_keyword_ci(trimmed, "ANALYZE") {
+        parse_analyze(rest)
     } else if let Some(rest) = strip_keyword_ci(trimmed, "MATCH") {
         let rest = expect_keyword_ci(rest, "GRAPH")?;
         parse_match_graph(rest)
@@ -1505,6 +1747,16 @@ fn parse_partitioning_clause(input: &str) -> Result<(PartitioningInfo, &str), Sq
             "unsupported time partition granularity".into(),
         ))
     }
+}
+
+fn parse_analyze(input: &str) -> Result<Statement, SqlDatabaseError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(Statement::Analyze { table: None });
+    }
+    let (table, rest) = parse_identifier(trimmed)?;
+    ensure_no_trailing_tokens(rest)?;
+    Ok(Statement::Analyze { table: Some(table) })
 }
 
 fn parse_literal_token(input: &str) -> Result<(Value, &str), SqlDatabaseError> {
@@ -2257,6 +2509,149 @@ fn rebuild_partitions(table: &mut Table) {
                 }
             }
         }
+    }
+}
+
+fn clamp_u64_to_i64(value: u64) -> i64 {
+    if value > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        value as i64
+    }
+}
+
+fn value_to_plain_string(value: &Value) -> String {
+    match value {
+        Value::Text(s) => s.clone(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Timestamp(ts) => ts.to_rfc3339(),
+        Value::Json(v) | Value::Jsonb(v) => serde_json::to_string(v).unwrap_or_default(),
+        Value::Xml(s) => s.clone(),
+        Value::Geometry(g) => geometry_to_string(g),
+        Value::Null => "NULL".to_string(),
+    }
+}
+
+fn distinct_key_for_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::Integer(i) => Some(format!("i:{i}")),
+        Value::Float(f) => Some(format!("f:{:x}", f.to_bits())),
+        Value::Text(s) => Some(format!("t:{s}")),
+        Value::Boolean(b) => Some(format!("b:{}", *b as u8)),
+        Value::Timestamp(ts) => {
+            let nanos = ts.timestamp_nanos_opt().unwrap_or_else(|| {
+                ts.timestamp().saturating_mul(1_000_000_000)
+                    + i64::from(ts.timestamp_subsec_nanos())
+            });
+            Some(format!("ts:{}", nanos))
+        }
+        Value::Json(v) => Some(format!("j:{}", canonical_json(v))),
+        Value::Jsonb(v) => Some(format!("jb:{}", canonical_json(v))),
+        Value::Xml(s) => Some(format!("x:{s}")),
+        Value::Geometry(g) => Some(format!("g:{}", geometry_to_string(g))),
+    }
+}
+
+fn compare_stat_values(column_type: ColumnType, left: &Value, right: &Value) -> Option<Ordering> {
+    match column_type {
+        ColumnType::Integer => match (left, right) {
+            (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+            _ => None,
+        },
+        ColumnType::Float => match (left, right) {
+            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+            _ => None,
+        },
+        ColumnType::Text => match (left, right) {
+            (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
+            _ => None,
+        },
+        ColumnType::Boolean => match (left, right) {
+            (Value::Boolean(a), Value::Boolean(b)) => Some((*a as u8).cmp(&(*b as u8))),
+            _ => None,
+        },
+        ColumnType::Timestamp => match (left, right) {
+            (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
+            _ => None,
+        },
+        ColumnType::Json | ColumnType::Jsonb | ColumnType::Geometry => None,
+        ColumnType::Xml => match (left, right) {
+            (Value::Xml(a), Value::Xml(b)) => Some(a.cmp(b)),
+            _ => None,
+        },
+    }
+}
+
+fn update_min_max(
+    column_type: ColumnType,
+    min_value: &mut Option<Value>,
+    max_value: &mut Option<Value>,
+    candidate: &Value,
+) {
+    if compare_stat_values(column_type, candidate, candidate).is_none() {
+        return;
+    }
+
+    match min_value {
+        Some(current_min) => {
+            if let Some(Ordering::Less) = compare_stat_values(column_type, candidate, current_min) {
+                *min_value = Some(candidate.clone());
+            }
+        }
+        None => *min_value = Some(candidate.clone()),
+    }
+
+    match max_value {
+        Some(current_max) => {
+            if let Some(Ordering::Greater) =
+                compare_stat_values(column_type, candidate, current_max)
+            {
+                *max_value = Some(candidate.clone());
+            }
+        }
+        None => *max_value = Some(candidate.clone()),
+    }
+}
+
+fn compute_column_statistics(
+    table_name: &str,
+    column: &Column,
+    column_index: usize,
+    rows: &[Vec<Value>],
+    analyzed_at: DateTime<Utc>,
+    stats_version: u32,
+) -> ColumnStatistics {
+    let mut null_count = 0u64;
+    let mut distinct_values: HashSet<String> = HashSet::new();
+    let mut min_value: Option<Value> = None;
+    let mut max_value: Option<Value> = None;
+
+    for row in rows {
+        if let Some(value) = row.get(column_index) {
+            if matches!(value, Value::Null) {
+                null_count += 1;
+                continue;
+            }
+            if let Some(key) = distinct_key_for_value(value) {
+                distinct_values.insert(key);
+            }
+            update_min_max(column.ty, &mut min_value, &mut max_value, value);
+        }
+    }
+
+    ColumnStatistics {
+        table_name: table_name.to_string(),
+        column_name: column.name.clone(),
+        data_type: column_type_name(column.ty).to_string(),
+        null_count,
+        distinct_count: distinct_values.len() as u64,
+        min: min_value,
+        max: max_value,
+        analyzed_at,
+        stats_version,
     }
 }
 
@@ -3875,5 +4270,123 @@ mod tests {
             }
             _ => panic!("unexpected result"),
         }
+    }
+
+    #[test]
+    fn analyze_populates_catalogs() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE metrics (id INT, score FLOAT, label TEXT, created TIMESTAMP);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO metrics VALUES (1, 0.5, 'alpha', '2024-01-01T00:00:00Z'), (2, 0.7, 'beta', '2024-01-02T00:00:00Z'), (3, 0.7, 'beta', '2024-01-02T00:00:00Z');",
+        )
+        .unwrap();
+
+        db.execute("ANALYZE metrics;").unwrap();
+
+        let table_stats = db.get_table_statistics("metrics").expect("table stats");
+        assert_eq!(table_stats.row_count, 3);
+        assert_eq!(table_stats.stats_version, 1);
+
+        let score_stats = db
+            .get_column_statistics("metrics", "score")
+            .expect("score stats");
+        assert_eq!(score_stats.null_count, 0);
+        assert_eq!(score_stats.distinct_count, 2);
+        assert_eq!(score_stats.min, Some(Value::Float(0.5)));
+        assert_eq!(score_stats.max, Some(Value::Float(0.7)));
+        assert_eq!(score_stats.stats_version, 1);
+        assert_eq!(score_stats.analyzed_at, table_stats.analyzed_at);
+
+        let label_stats = db
+            .get_column_statistics("metrics", "label")
+            .expect("label stats");
+        assert_eq!(label_stats.min, Some(Value::Text("alpha".into())));
+        assert_eq!(label_stats.max, Some(Value::Text("beta".into())));
+
+        let catalog = db
+            .execute("SELECT table_name, row_count FROM __aidb_table_stats;")
+            .unwrap();
+        match catalog {
+            QueryResult::Rows { rows, .. } => {
+                assert!(rows.contains(&vec![Value::Text("metrics".into()), Value::Integer(3)]));
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+
+        let column_catalog = db
+            .execute("SELECT table_name, column_name, distinct_count FROM __aidb_column_stats;")
+            .unwrap();
+        match column_catalog {
+            QueryResult::Rows { rows, .. } => {
+                assert!(rows.contains(&vec![
+                    Value::Text("metrics".into()),
+                    Value::Text("score".into()),
+                    Value::Integer(2),
+                ]));
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_increments_version_on_reanalyze() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE readings (id INT, value FLOAT);")
+            .unwrap();
+        db.execute("INSERT INTO readings VALUES (1, 10.0), (2, 11.0);")
+            .unwrap();
+        db.execute("ANALYZE readings;").unwrap();
+        let first = db.get_table_statistics("readings").expect("initial stats");
+
+        db.execute("INSERT INTO readings VALUES (3, 12.5);")
+            .unwrap();
+        db.execute("ANALYZE readings;").unwrap();
+
+        let second = db.get_table_statistics("readings").expect("updated stats");
+        assert_eq!(second.stats_version, first.stats_version + 1);
+        assert!(second.analyzed_at >= first.analyzed_at);
+
+        let id_stats = db
+            .get_column_statistics("readings", "id")
+            .expect("id stats");
+        assert_eq!(id_stats.max, Some(Value::Integer(3)));
+        assert_eq!(id_stats.distinct_count, 3);
+        assert_eq!(id_stats.stats_version, second.stats_version);
+    }
+
+    #[test]
+    fn analyze_all_tables_without_argument() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE a (id INT);").unwrap();
+        db.execute("CREATE TABLE b (name TEXT);").unwrap();
+        db.execute("INSERT INTO a VALUES (1), (2);").unwrap();
+        db.execute("INSERT INTO b VALUES ('x');").unwrap();
+
+        db.execute("ANALYZE;").unwrap();
+
+        assert!(db.get_table_statistics("a").is_some());
+        assert!(db.get_table_statistics("b").is_some());
+
+        let a_id = db.get_column_statistics("a", "id").expect("stats for a.id");
+        assert_eq!(a_id.distinct_count, 2);
+    }
+
+    #[test]
+    fn analyze_unknown_table_returns_error() {
+        let mut db = SqlDatabase::new();
+        let err = db.execute("ANALYZE missing;");
+        assert!(matches!(err, Err(SqlDatabaseError::UnknownTable(table)) if table == "missing"));
+    }
+
+    #[test]
+    fn system_catalog_is_read_only() {
+        let mut db = SqlDatabase::new();
+        let err = db.execute(
+            "INSERT INTO __aidb_table_stats VALUES ('demo', 1, '2024-01-01T00:00:00Z', 1);",
+        );
+        assert!(
+            matches!(err, Err(SqlDatabaseError::SystemTableModification(name)) if name == "__aidb_table_stats")
+        );
     }
 }
