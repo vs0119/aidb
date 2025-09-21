@@ -1,11 +1,11 @@
 use chrono::Datelike;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use roxmltree::Document;
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
@@ -296,6 +296,9 @@ pub struct HistogramBucket {
 pub struct SqlDatabase {
     tables: HashMap<String, Table>,
     system_tables: HashMap<String, Table>,
+    materialized_views: HashMap<String, MaterializedView>,
+    materialized_view_dependencies: HashMap<String, HashSet<String>>,
+    pending_view_refreshes: VecDeque<MaterializedViewRefreshRequest>,
     graphs: HashMap<String, Graph>,
     table_stats_catalog: HashMap<String, TableStatistics>,
     column_stats_catalog: HashMap<(String, String), ColumnStatistics>,
@@ -384,6 +387,12 @@ pub enum SqlDatabaseError {
     TableExists(String),
     #[error("table '{0}' does not exist")]
     UnknownTable(String),
+    #[error("materialized view '{0}' already exists")]
+    MaterializedViewExists(String),
+    #[error("materialized view '{0}' does not exist")]
+    UnknownMaterializedView(String),
+    #[error("cannot modify materialized view '{0}' directly")]
+    MaterializedViewModification(String),
     #[error("unknown column '{0}'")]
     UnknownColumn(String),
     #[error("schema mismatch: {0}")]
@@ -468,6 +477,31 @@ impl Default for ExecutionConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializedViewRefreshMode {
+    Synchronous,
+    Asynchronous,
+}
+
+#[derive(Debug)]
+struct MaterializedView {
+    name: String,
+    definition: SelectStatement,
+    refresh_mode: MaterializedViewRefreshMode,
+    table: Table,
+    dependencies: Vec<String>,
+    last_refreshed_at: Option<DateTime<Utc>>,
+    pending_async_refresh: bool,
+}
+
+#[derive(Debug)]
+struct MaterializedViewRefreshRequest {
+    view: String,
+    due: DateTime<Utc>,
+}
+
+const ASYNC_REFRESH_DELAY: Duration = Duration::milliseconds(50);
+
 impl SqlDatabase {
     pub fn new() -> Self {
         let execution_config = ExecutionConfig::default();
@@ -476,6 +510,9 @@ impl SqlDatabase {
         let mut db = Self {
             tables: HashMap::new(),
             system_tables: HashMap::new(),
+            materialized_views: HashMap::new(),
+            materialized_view_dependencies: HashMap::new(),
+            pending_view_refreshes: VecDeque::new(),
             graphs: HashMap::new(),
             table_stats_catalog: HashMap::new(),
             column_stats_catalog: HashMap::new(),
@@ -519,6 +556,24 @@ impl SqlDatabase {
         if let Ok(mut stats) = self.execution_stats.lock() {
             *stats = ExecutionStats::default();
         }
+    }
+
+    pub fn run_pending_refreshes(&mut self) -> Result<(), SqlDatabaseError> {
+        self.process_scheduled_refreshes(true)
+    }
+
+    fn process_scheduled_refreshes(&mut self, force: bool) -> Result<(), SqlDatabaseError> {
+        let now = Utc::now();
+        let mut remaining = VecDeque::new();
+        while let Some(request) = self.pending_view_refreshes.pop_front() {
+            if force || request.due <= now {
+                self.refresh_materialized_view_now(&request.view)?;
+            } else {
+                remaining.push_back(request);
+            }
+        }
+        self.pending_view_refreshes = remaining;
+        Ok(())
     }
 
     pub fn last_execution_stats(&self) -> ExecutionStats {
@@ -704,6 +759,109 @@ impl SqlDatabase {
         self.invalidate_cache_for_table(name);
     }
 
+    fn register_materialized_view_dependencies(&mut self, view: &str, dependencies: &[String]) {
+        for dependency in dependencies {
+            self.materialized_view_dependencies
+                .entry(dependency.clone())
+                .or_default()
+                .insert(view.to_string());
+        }
+    }
+
+    fn collect_materialized_view_dependencies(
+        &self,
+        select: &SelectStatement,
+    ) -> Result<Vec<String>, SqlDatabaseError> {
+        if self.tables.contains_key(&select.table)
+            || self.materialized_views.contains_key(&select.table)
+            || self.system_tables.contains_key(&select.table)
+        {
+            Ok(vec![select.table.clone()])
+        } else {
+            Err(SqlDatabaseError::UnknownTable(select.table.clone()))
+        }
+    }
+
+    fn schedule_materialized_view_refresh(&mut self, name: &str) -> Result<(), SqlDatabaseError> {
+        let view = self
+            .materialized_views
+            .get_mut(name)
+            .ok_or_else(|| SqlDatabaseError::UnknownMaterializedView(name.to_string()))?;
+        if view.pending_async_refresh {
+            return Ok(());
+        }
+        view.pending_async_refresh = true;
+        let due = Utc::now() + ASYNC_REFRESH_DELAY;
+        self.pending_view_refreshes
+            .push_back(MaterializedViewRefreshRequest {
+                view: name.to_string(),
+                due,
+            });
+        Ok(())
+    }
+
+    fn on_relation_changed(&mut self, name: &str) -> Result<(), SqlDatabaseError> {
+        if let Some(dependents) = self.materialized_view_dependencies.get(name).cloned() {
+            for dependent in dependents {
+                let mode = match self.materialized_views.get(&dependent) {
+                    Some(view) => view.refresh_mode,
+                    None => continue,
+                };
+                match mode {
+                    MaterializedViewRefreshMode::Synchronous => {
+                        self.refresh_materialized_view_now(&dependent)?;
+                    }
+                    MaterializedViewRefreshMode::Asynchronous => {
+                        self.schedule_materialized_view_refresh(&dependent)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn find_covering_materialized_view(
+        &self,
+        select: &SelectStatement,
+    ) -> Option<&MaterializedView> {
+        self.materialized_views
+            .values()
+            .find(|view| view.definition == *select)
+    }
+
+    fn refresh_materialized_view_now(&mut self, name: &str) -> Result<(), SqlDatabaseError> {
+        let mut view = self
+            .materialized_views
+            .remove(name)
+            .ok_or_else(|| SqlDatabaseError::UnknownMaterializedView(name.to_string()))?;
+        let definition = view.definition.clone();
+        let result =
+            match self.exec_select_statement(&HashMap::new(), &definition, ExecutionMode::Row) {
+                Ok(result) => result,
+                Err(err) => {
+                    view.pending_async_refresh = false;
+                    self.materialized_views.insert(name.to_string(), view);
+                    return Err(err);
+                }
+            };
+        let (columns, rows) = match result {
+            QueryResult::Rows { columns, rows } => (columns, rows),
+            _ => {
+                view.pending_async_refresh = false;
+                self.materialized_views.insert(name.to_string(), view);
+                return Err(SqlDatabaseError::Unsupported);
+            }
+        };
+        view.table = table_from_rows(columns, rows);
+        view.last_refreshed_at = Some(Utc::now());
+        view.pending_async_refresh = false;
+        let name_owned = name.to_string();
+        self.materialized_views.insert(name_owned.clone(), view);
+        self.notify_materialized_view_update(&name_owned);
+        self.on_relation_changed(&name_owned)?;
+        Ok(())
+    }
+
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult, SqlDatabaseError> {
         self.execute_with_mode(sql, ExecutionMode::Auto)
     }
@@ -713,6 +871,7 @@ impl SqlDatabase {
         sql: &str,
         mode: ExecutionMode,
     ) -> Result<QueryResult, SqlDatabaseError> {
+        self.process_scheduled_refreshes(false)?;
         let stmt = parse_statement(sql)?;
         self.reset_execution_stats();
         match stmt {
@@ -722,6 +881,14 @@ impl SqlDatabase {
                 partitioning,
             } => {
                 self.exec_create_table(name, columns, partitioning)?;
+                Ok(QueryResult::None)
+            }
+            Statement::CreateMaterializedView {
+                name,
+                query,
+                refresh,
+            } => {
+                self.exec_create_materialized_view(name, query, refresh)?;
                 Ok(QueryResult::None)
             }
             Statement::Insert {
@@ -760,6 +927,10 @@ impl SqlDatabase {
                 self.exec_analyze(table)?;
                 Ok(QueryResult::None)
             }
+            Statement::RefreshMaterializedView { name, strategy } => {
+                self.exec_refresh_materialized_view(name, strategy)?;
+                Ok(QueryResult::None)
+            }
             Statement::ShowTables => self.exec_show_tables(),
             Statement::MatchGraph {
                 graph,
@@ -782,6 +953,9 @@ impl SqlDatabase {
         }
         if self.tables.contains_key(&name) {
             return Err(SqlDatabaseError::TableExists(name));
+        }
+        if self.materialized_views.contains_key(&name) {
+            return Err(SqlDatabaseError::MaterializedViewExists(name));
         }
         if columns.is_empty() {
             return Err(SqlDatabaseError::SchemaMismatch(
@@ -815,6 +989,43 @@ impl SqlDatabase {
         Ok(())
     }
 
+    fn exec_create_materialized_view(
+        &mut self,
+        name: String,
+        query: SelectStatement,
+        refresh: MaterializedViewRefreshMode,
+    ) -> Result<(), SqlDatabaseError> {
+        if self.is_system_table(&name) {
+            return Err(SqlDatabaseError::SystemTableModification(name));
+        }
+        if self.tables.contains_key(&name) {
+            return Err(SqlDatabaseError::TableExists(name));
+        }
+        if self.materialized_views.contains_key(&name) {
+            return Err(SqlDatabaseError::MaterializedViewExists(name));
+        }
+        let dependencies = self.collect_materialized_view_dependencies(&query)?;
+        let result = self.exec_select_statement(&HashMap::new(), &query, ExecutionMode::Row)?;
+        let (columns, rows) = match result {
+            QueryResult::Rows { columns, rows } => (columns, rows),
+            _ => return Err(SqlDatabaseError::Unsupported),
+        };
+        let table = table_from_rows(columns, rows);
+        let view = MaterializedView {
+            name: name.clone(),
+            definition: query,
+            refresh_mode: refresh,
+            table,
+            dependencies: dependencies.clone(),
+            last_refreshed_at: Some(Utc::now()),
+            pending_async_refresh: false,
+        };
+        self.materialized_views.insert(name.clone(), view);
+        self.register_materialized_view_dependencies(&name, &dependencies);
+        self.notify_materialized_view_update(&name);
+        Ok(())
+    }
+
     fn exec_insert(
         &mut self,
         table_name: String,
@@ -823,6 +1034,9 @@ impl SqlDatabase {
     ) -> Result<usize, SqlDatabaseError> {
         if self.is_system_table(&table_name) {
             return Err(SqlDatabaseError::SystemTableModification(table_name));
+        }
+        if self.materialized_views.contains_key(&table_name) {
+            return Err(SqlDatabaseError::MaterializedViewModification(table_name));
         }
         let table = self
             .tables
@@ -870,7 +1084,24 @@ impl SqlDatabase {
             inserted += 1;
         }
         self.invalidate_cache_for_table(&table_name);
+        self.on_relation_changed(&table_name)?;
         Ok(inserted)
+    }
+
+    fn exec_refresh_materialized_view(
+        &mut self,
+        name: String,
+        strategy: MaterializedViewRefreshMode,
+    ) -> Result<(), SqlDatabaseError> {
+        match strategy {
+            MaterializedViewRefreshMode::Synchronous => {
+                self.refresh_materialized_view_now(&name)?;
+            }
+            MaterializedViewRefreshMode::Asynchronous => {
+                self.schedule_materialized_view_refresh(&name)?;
+            }
+        }
+        Ok(())
     }
 
     fn exec_analyze(&mut self, target: Option<String>) -> Result<(), SqlDatabaseError> {
@@ -929,15 +1160,26 @@ impl SqlDatabase {
     }
 
     fn exec_show_tables(&self) -> Result<QueryResult, SqlDatabaseError> {
+        let mut entries: Vec<(String, i64)> = self
+            .tables
+            .iter()
+            .map(|(name, table)| (name.clone(), table.rows.len() as i64))
+            .collect();
+        entries.extend(
+            self.materialized_views
+                .iter()
+                .map(|(name, view)| (name.clone(), view.table.rows.len() as i64)),
+        );
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
         let mut rows = Vec::new();
-        for (table_name, table) in &self.tables {
-            let row = vec![
-                Value::Text(table_name.clone()),
-                Value::Integer(table.rows.len() as i64),
-                Value::Null, // created_at - not available
-                Value::Null, // size - not available
-            ];
-            rows.push(row);
+        for (name, count) in entries {
+            rows.push(vec![
+                Value::Text(name),
+                Value::Integer(count),
+                Value::Null,
+                Value::Null,
+            ]);
         }
 
         let columns = vec![
@@ -971,6 +1213,32 @@ impl SqlDatabase {
                 select.table.as_str(),
                 planner::TableSource::Cte,
                 table,
+            );
+            self.exec_select_from_table(
+                resolved,
+                &select.columns,
+                select.predicate.as_ref(),
+                cte_tables,
+                mode,
+            )
+        } else if let Some(view) = self.materialized_views.get(&select.table) {
+            let resolved = planner::ResolvedTable::new(
+                view.name.as_str(),
+                planner::TableSource::MaterializedView,
+                &view.table,
+            );
+            self.exec_select_from_table(
+                resolved,
+                &select.columns,
+                select.predicate.as_ref(),
+                cte_tables,
+                mode,
+            )
+        } else if let Some(view) = self.find_covering_materialized_view(select) {
+            let resolved = planner::ResolvedTable::new(
+                view.name.as_str(),
+                planner::TableSource::MaterializedView,
+                &view.table,
             );
             self.exec_select_from_table(
                 resolved,
@@ -1654,10 +1922,13 @@ impl SqlDatabase {
             }
             planner::LogicalExpr::Scan(scan) => match scan.table.source {
                 planner::TableSource::Cte => None,
-                planner::TableSource::Base | planner::TableSource::System => {
+                planner::TableSource::Base
+                | planner::TableSource::System
+                | planner::TableSource::MaterializedView => {
                     let source = match scan.table.source {
                         planner::TableSource::Base => "base",
                         planner::TableSource::System => "system",
+                        planner::TableSource::MaterializedView => "materialized",
                         planner::TableSource::Cte => unreachable!(),
                     };
                     let mut shape = format!("scan:{source}:{}", scan.table.name);
@@ -1805,6 +2076,9 @@ impl SqlDatabase {
         };
 
         let target_name = merge.target.name.clone();
+        if self.materialized_views.contains_key(&target_name) {
+            return Err(SqlDatabaseError::MaterializedViewModification(target_name));
+        }
         let (target_on_idx, matched_assignments, insert_info) = {
             let table = self
                 .tables
@@ -1906,6 +2180,7 @@ impl SqlDatabase {
         if modified {
             rebuild_secondary_indexes(target_table);
             self.invalidate_cache_for_table(&target_name);
+            self.on_relation_changed(&target_name)?;
         }
 
         Ok(QueryResult::None)
@@ -2183,7 +2458,7 @@ impl SqlDatabase {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 struct SelectStatement {
     table: String,
     columns: SelectColumns,
@@ -2279,6 +2554,11 @@ enum Statement {
         columns: Vec<(String, ColumnType)>,
         partitioning: Option<PartitioningInfo>,
     },
+    CreateMaterializedView {
+        name: String,
+        query: SelectStatement,
+        refresh: MaterializedViewRefreshMode,
+    },
     Insert {
         table: String,
         columns: Option<Vec<String>>,
@@ -2310,6 +2590,10 @@ enum Statement {
     Analyze {
         table: Option<String>,
     },
+    RefreshMaterializedView {
+        name: String,
+        strategy: MaterializedViewRefreshMode,
+    },
     ShowTables,
     MatchGraph {
         graph: String,
@@ -2320,13 +2604,13 @@ enum Statement {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum SelectColumns {
     All,
     Some(Vec<SelectItem>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum SelectItem {
     Column(String),
     WindowFunction(WindowFunctionExpr),
@@ -2344,7 +2628,7 @@ enum ProjectionKind {
     Window { index: usize },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct WindowFunctionExpr {
     function: WindowFunctionType,
     partition_by: Option<String>,
@@ -2352,7 +2636,7 @@ struct WindowFunctionExpr {
     alias: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowFunctionType {
     RowNumber,
 }
@@ -2365,7 +2649,7 @@ impl WindowFunctionType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Predicate {
     Equals {
         column: String,
@@ -2433,6 +2717,9 @@ fn parse_statement(sql: &str) -> Result<Statement, SqlDatabaseError> {
         let rest = rest.trim_start();
         if let Some(rest) = strip_keyword_ci(rest, "TABLE") {
             parse_create_table(rest)
+        } else if let Some(rest) = strip_keyword_ci(rest, "MATERIALIZED") {
+            let rest = expect_keyword_ci(rest, "VIEW")?;
+            parse_create_materialized_view(rest)
         } else if let Some(rest) = strip_keyword_ci(rest, "GRAPH") {
             parse_create_graph(rest)
         } else if let Some(rest) = strip_keyword_ci(rest, "NODE") {
@@ -2461,6 +2748,8 @@ fn parse_statement(sql: &str) -> Result<Statement, SqlDatabaseError> {
         })
     } else if let Some(rest) = strip_keyword_ci(trimmed, "ANALYZE") {
         parse_analyze(rest)
+    } else if let Some(rest) = strip_keyword_ci(trimmed, "REFRESH") {
+        parse_refresh(rest)
     } else if let Some(rest) = strip_keyword_ci(trimmed, "SHOW") {
         parse_show(rest)
     } else if let Some(rest) = strip_keyword_ci(trimmed, "MATCH") {
@@ -2504,6 +2793,35 @@ fn parse_create_table(input: &str) -> Result<Statement, SqlDatabaseError> {
         name,
         columns,
         partitioning,
+    })
+}
+
+fn parse_create_materialized_view(input: &str) -> Result<Statement, SqlDatabaseError> {
+    let (name, rest) = parse_identifier(input)?;
+    let rest = rest.trim_start();
+    let (refresh, rest) = if let Some(after_refresh) = strip_keyword_ci(rest, "REFRESH") {
+        let after_refresh = after_refresh.trim_start();
+        if let Some(after_sync) = strip_keyword_ci(after_refresh, "SYNCHRONOUS") {
+            (MaterializedViewRefreshMode::Synchronous, after_sync)
+        } else if let Some(after_async) = strip_keyword_ci(after_refresh, "ASYNCHRONOUS") {
+            (MaterializedViewRefreshMode::Asynchronous, after_async)
+        } else {
+            return Err(SqlDatabaseError::Parse(
+                "expected SYNCHRONOUS or ASYNCHRONOUS after REFRESH".into(),
+            ));
+        }
+    } else {
+        (MaterializedViewRefreshMode::Synchronous, rest)
+    };
+    let rest = expect_keyword_ci(rest, "AS")?;
+    let rest = rest.trim_start();
+    let select_body = strip_keyword_ci(rest, "SELECT")
+        .ok_or_else(|| SqlDatabaseError::Parse("materialized view requires SELECT".into()))?;
+    let query = parse_select_statement(select_body)?;
+    Ok(Statement::CreateMaterializedView {
+        name,
+        query,
+        refresh,
     })
 }
 
@@ -2584,6 +2902,37 @@ fn parse_analyze(input: &str) -> Result<Statement, SqlDatabaseError> {
     let (table, rest) = parse_identifier(trimmed)?;
     ensure_no_trailing_tokens(rest)?;
     Ok(Statement::Analyze { table: Some(table) })
+}
+
+fn parse_refresh(input: &str) -> Result<Statement, SqlDatabaseError> {
+    let rest = input.trim_start();
+    if let Some(after_materialized) = strip_keyword_ci(rest, "MATERIALIZED") {
+        let rest = expect_keyword_ci(after_materialized, "VIEW")?;
+        parse_refresh_materialized_view(rest)
+    } else {
+        Err(SqlDatabaseError::Parse(
+            "REFRESH supports MATERIALIZED VIEW only".into(),
+        ))
+    }
+}
+
+fn parse_refresh_materialized_view(input: &str) -> Result<Statement, SqlDatabaseError> {
+    let (name, rest) = parse_identifier(input)?;
+    let rest = rest.trim();
+    let strategy = if rest.is_empty() {
+        MaterializedViewRefreshMode::Synchronous
+    } else if let Some(after_sync) = strip_keyword_ci(rest, "SYNCHRONOUS") {
+        ensure_no_trailing_tokens(after_sync)?;
+        MaterializedViewRefreshMode::Synchronous
+    } else if let Some(after_async) = strip_keyword_ci(rest, "ASYNCHRONOUS") {
+        ensure_no_trailing_tokens(after_async)?;
+        MaterializedViewRefreshMode::Asynchronous
+    } else {
+        return Err(SqlDatabaseError::Parse(
+            "expected SYNCHRONOUS or ASYNCHRONOUS".into(),
+        ));
+    };
+    Ok(Statement::RefreshMaterializedView { name, strategy })
 }
 
 fn parse_show(input: &str) -> Result<Statement, SqlDatabaseError> {
@@ -5206,6 +5555,85 @@ mod tests {
             }
             _ => panic!("unexpected result"),
         }
+    }
+
+    #[test]
+    fn materialized_view_synchronous_refresh() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE users (id INT, active BOOLEAN);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, true);").unwrap();
+        db.execute(
+            "CREATE MATERIALIZED VIEW active_users REFRESH SYNCHRONOUS AS SELECT id FROM users WHERE active = true;",
+        )
+        .unwrap();
+        db.execute("INSERT INTO users VALUES (2, true);").unwrap();
+
+        let result = db
+            .execute("SELECT id FROM users WHERE active = true;")
+            .unwrap();
+        let mut ids: Vec<i64> = row_values(&result)
+            .iter()
+            .map(|row| match row[0] {
+                Value::Integer(id) => id,
+                other => panic!("unexpected value {other:?}"),
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+
+        let direct = db.execute("SELECT id FROM active_users;").unwrap();
+        let mut direct_ids: Vec<i64> = row_values(&direct)
+            .iter()
+            .map(|row| match row[0] {
+                Value::Integer(id) => id,
+                other => panic!("unexpected value {other:?}"),
+            })
+            .collect();
+        direct_ids.sort();
+        assert_eq!(direct_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn materialized_view_asynchronous_refresh_and_rewrite() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE events (id INT, kind TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO events VALUES (1, 'login');")
+            .unwrap();
+        db.execute(
+            "CREATE MATERIALIZED VIEW login_events REFRESH ASYNCHRONOUS AS SELECT id FROM events WHERE kind = 'login';",
+        )
+        .unwrap();
+        db.execute("INSERT INTO events VALUES (2, 'login');")
+            .unwrap();
+
+        let initial = db
+            .execute("SELECT id FROM events WHERE kind = 'login';")
+            .unwrap();
+        let ids: Vec<i64> = row_values(&initial)
+            .iter()
+            .map(|row| match row[0] {
+                Value::Integer(id) => id,
+                other => panic!("unexpected value {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![1]);
+
+        db.run_pending_refreshes().unwrap();
+
+        let refreshed = db
+            .execute("SELECT id FROM events WHERE kind = 'login';")
+            .unwrap();
+        let mut refreshed_ids: Vec<i64> = row_values(&refreshed)
+            .iter()
+            .map(|row| match row[0] {
+                Value::Integer(id) => id,
+                other => panic!("unexpected value {other:?}"),
+            })
+            .collect();
+        refreshed_ids.sort();
+        assert_eq!(refreshed_ids, vec![1, 2]);
     }
 
     #[test]
