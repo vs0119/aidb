@@ -1,9 +1,11 @@
 use crate::{Predicate, SelectColumns};
 
+use super::cardinality::JoinPredicate;
 use super::context::PlanContext;
 use super::cost::{CostEstimate, CostModel};
 use super::logical::{
-    FilterExpr, LogicalExpr, LogicalPlan, ProjectionExpr, ScanCandidates, ScanExpr, ScanOptions,
+    FilterExpr, JoinExpr, LogicalExpr, LogicalPlan, ProjectionExpr, ScanCandidates, ScanExpr,
+    ScanOptions,
 };
 use super::table_ref::ResolvedTable;
 
@@ -22,6 +24,11 @@ pub enum MemoExpr<'a> {
     Filter {
         predicate: Predicate,
         input: GroupId,
+    },
+    Join {
+        left: GroupId,
+        right: GroupId,
+        predicate: JoinPredicate,
     },
     Scan {
         table: ResolvedTable<'a>,
@@ -70,6 +77,22 @@ impl<'a> PartialEq for MemoExpr<'a> {
                     && std::ptr::eq(left_table.table, right_table.table)
                     && left_candidates == right_candidates
                     && left_options == right_options
+            }
+            (
+                MemoExpr::Join {
+                    left: left_left,
+                    right: left_right,
+                    predicate: left_predicate,
+                },
+                MemoExpr::Join {
+                    left: right_left,
+                    right: right_right,
+                    predicate: right_predicate,
+                },
+            ) => {
+                left_left == right_left
+                    && left_right == right_right
+                    && left_predicate == right_predicate
             }
             _ => false,
         }
@@ -122,6 +145,15 @@ impl<'a> Memo<'a> {
                 let input = self.insert_expr(*filter.input);
                 let predicate = filter.predicate;
                 self.insert_operator(MemoExpr::Filter { predicate, input })
+            }
+            LogicalExpr::Join(join) => {
+                let left = self.insert_expr(*join.left);
+                let right = self.insert_expr(*join.right);
+                self.insert_operator(MemoExpr::Join {
+                    left,
+                    right,
+                    predicate: join.predicate,
+                })
             }
             LogicalExpr::Scan(scan) => self.insert_operator(MemoExpr::Scan {
                 table: scan.table,
@@ -198,6 +230,47 @@ impl<'a> Memo<'a> {
         }
     }
 
+    fn resolve_context_for_table<'b>(
+        &self,
+        table: &ResolvedTable<'a>,
+        contexts: &'b [PlanContext<'a>],
+    ) -> Option<&'b PlanContext<'a>> {
+        let ptr = table.table as *const _ as usize;
+        contexts
+            .iter()
+            .find(|ctx| ctx.table.table as *const _ as usize == ptr)
+    }
+
+    fn resolve_context_for_group<'b>(
+        &self,
+        group: GroupId,
+        contexts: &'b [PlanContext<'a>],
+    ) -> Option<&'b PlanContext<'a>> {
+        let table = self.find_base_table(group)?;
+        self.resolve_context_for_table(&table, contexts)
+    }
+
+    fn find_base_table(&self, group: GroupId) -> Option<ResolvedTable<'a>> {
+        let group_ref = self.group(group);
+        for &expr_id in &group_ref.expressions {
+            if let Some(table) = self.expr_base_table(expr_id) {
+                return Some(table);
+            }
+        }
+        None
+    }
+
+    fn expr_base_table(&self, expr_id: ExprId) -> Option<ResolvedTable<'a>> {
+        let expr = self.expression(expr_id).expr.clone();
+        match expr {
+            MemoExpr::Scan { table, .. } => Some(table),
+            MemoExpr::Projection { input, .. } | MemoExpr::Filter { input, .. } => {
+                self.find_base_table(input)
+            }
+            MemoExpr::Join { .. } => None,
+        }
+    }
+
     pub fn rebuild_logical(&self) -> LogicalPlan<'a> {
         let root_expr = self.extract_group(self.root);
         LogicalPlan { root: root_expr }
@@ -222,6 +295,19 @@ impl<'a> Memo<'a> {
                     input: Box::new(input_expr),
                 })
             }
+            MemoExpr::Join {
+                left,
+                right,
+                predicate,
+            } => {
+                let left_expr = self.extract_group(*left);
+                let right_expr = self.extract_group(*right);
+                LogicalExpr::Join(JoinExpr {
+                    left: Box::new(left_expr),
+                    right: Box::new(right_expr),
+                    predicate: predicate.clone(),
+                })
+            }
             MemoExpr::Scan {
                 table,
                 candidates,
@@ -234,15 +320,19 @@ impl<'a> Memo<'a> {
         }
     }
 
-    pub fn choose_best_expressions(&mut self, context: &PlanContext<'a>, cost_model: &CostModel) {
+    pub fn choose_best_expressions(
+        &mut self,
+        contexts: &[PlanContext<'a>],
+        cost_model: &CostModel,
+    ) {
         self.reset_costs();
-        self.compute_group_cost(self.root, context, cost_model);
+        self.compute_group_cost(self.root, contexts, cost_model);
     }
 
     fn compute_group_cost(
         &mut self,
         group_id: GroupId,
-        context: &PlanContext<'a>,
+        contexts: &[PlanContext<'a>],
         cost_model: &CostModel,
     ) -> CostEstimate {
         if let Some(cost) = self.groups[group_id.0].best_cost {
@@ -254,7 +344,7 @@ impl<'a> Memo<'a> {
         let mut best_cost = None;
 
         for expr_id in expr_ids {
-            let cost = self.compute_expression_cost(expr_id, context, cost_model);
+            let cost = self.compute_expression_cost(expr_id, contexts, cost_model);
             if best_cost
                 .map(|existing: CostEstimate| cost.total_cost() < existing.total_cost())
                 .unwrap_or(true)
@@ -273,24 +363,61 @@ impl<'a> Memo<'a> {
     fn compute_expression_cost(
         &mut self,
         expr_id: ExprId,
-        context: &PlanContext<'a>,
+        contexts: &[PlanContext<'a>],
         cost_model: &CostModel,
     ) -> CostEstimate {
         let expr = self.expressions[expr_id.0].expr.clone();
         match expr {
             MemoExpr::Projection { columns, input } => {
-                let input_cost = self.compute_group_cost(input, context, cost_model);
-                cost_model.estimate_projection(input_cost, context, &columns)
+                let input_cost = self.compute_group_cost(input, contexts, cost_model);
+                let base_context = self
+                    .resolve_context_for_group(input, contexts)
+                    .unwrap_or_else(|| contexts.first().expect("at least one context"));
+                cost_model.estimate_projection(input_cost, base_context, &columns)
             }
             MemoExpr::Filter { predicate, input } => {
-                let input_cost = self.compute_group_cost(input, context, cost_model);
-                cost_model.estimate_filter(context, &predicate, input_cost)
+                let input_cost = self.compute_group_cost(input, contexts, cost_model);
+                let base_context = self
+                    .resolve_context_for_group(input, contexts)
+                    .unwrap_or_else(|| contexts.first().expect("at least one context"));
+                cost_model.estimate_filter(base_context, &predicate, input_cost)
+            }
+            MemoExpr::Join {
+                left,
+                right,
+                predicate,
+            } => {
+                let left_cost = self.compute_group_cost(left, contexts, cost_model);
+                let right_cost = self.compute_group_cost(right, contexts, cost_model);
+                let (left_ctx, right_ctx) = (
+                    self.resolve_context_for_group(left, contexts),
+                    self.resolve_context_for_group(right, contexts),
+                );
+                let join_cost = if let (Some(left_ctx), Some(right_ctx)) = (left_ctx, right_ctx) {
+                    cost_model.estimate_join(left_ctx, right_ctx, &predicate)
+                } else {
+                    cost_model.estimate_join(
+                        contexts.first().expect("at least one plan context"),
+                        contexts.first().expect("at least one plan context"),
+                        &predicate,
+                    )
+                };
+                super::cost::CostEstimate {
+                    cardinality: join_cost.cardinality,
+                    cpu_cost: left_cost.cpu_cost + right_cost.cpu_cost + join_cost.cpu_cost,
+                    io_cost: left_cost.io_cost + right_cost.io_cost + join_cost.io_cost,
+                }
             }
             MemoExpr::Scan {
                 candidates,
                 options,
-                ..
-            } => cost_model.estimate_scan(context, &candidates, &options),
+                table,
+            } => {
+                let context = self
+                    .resolve_context_for_table(&table, contexts)
+                    .unwrap_or_else(|| contexts.first().expect("at least one context"));
+                cost_model.estimate_scan(context, &candidates, &options)
+            }
         }
     }
 }

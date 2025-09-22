@@ -144,6 +144,7 @@ impl FilterPushdownRule {
                         changed = true;
                     }
                 }
+                MemoExpr::Join { .. } => {}
             }
         }
 
@@ -268,6 +269,7 @@ impl ProjectionPushdownRule {
                         changed = true;
                     }
                 }
+                MemoExpr::Join { .. } => {}
             }
         }
 

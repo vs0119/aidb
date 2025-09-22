@@ -24,6 +24,10 @@ impl<'a> ColumnVector<'a> {
         &self.values
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.values.len()
+    }
+
     pub(crate) fn retain_by_mask(&mut self, mask: &[bool]) {
         debug_assert_eq!(mask.len(), self.values.len());
         let mut write = 0usize;
@@ -83,10 +87,6 @@ impl<'a> ColumnarBatch<'a> {
         &self.columns[index]
     }
 
-    pub(crate) fn columns(&self) -> &[ColumnVector<'a>] {
-        &self.columns
-    }
-
     pub(crate) fn retain_by_mask(&mut self, mask: &[bool]) {
         debug_assert_eq!(mask.len(), self.len());
         let mut write = 0usize;
@@ -116,5 +116,21 @@ impl<'a> ColumnarBatch<'a> {
             columns: projected_columns,
             row_indices: self.row_indices.clone(),
         }
+    }
+
+    pub(crate) fn to_rows(&self) -> Vec<Vec<Value>> {
+        let mut rows = Vec::new();
+        if self.is_empty() {
+            return rows;
+        }
+        let column_count = self.column_count();
+        for row_idx in 0..self.len() {
+            let mut row = Vec::with_capacity(column_count);
+            for column in &self.columns {
+                row.push(column.value(row_idx).clone());
+            }
+            rows.push(row);
+        }
+        rows
     }
 }

@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::{Predicate, SelectColumns};
 
+use super::cardinality::JoinPredicate;
 use super::table_ref::ResolvedTable;
 
 #[derive(Clone)]
@@ -19,6 +20,7 @@ impl<'a> fmt::Debug for LogicalPlan<'a> {
 pub enum LogicalExpr<'a> {
     Projection(ProjectionExpr<'a>),
     Filter(FilterExpr<'a>),
+    Join(JoinExpr<'a>),
     Scan(ScanExpr<'a>),
 }
 
@@ -27,6 +29,7 @@ impl<'a> fmt::Debug for LogicalExpr<'a> {
         match self {
             LogicalExpr::Projection(expr) => expr.fmt(f),
             LogicalExpr::Filter(expr) => expr.fmt(f),
+            LogicalExpr::Join(expr) => expr.fmt(f),
             LogicalExpr::Scan(expr) => expr.fmt(f),
         }
     }
@@ -58,6 +61,23 @@ impl<'a> fmt::Debug for FilterExpr<'a> {
         f.debug_struct("Filter")
             .field("predicate", &self.predicate)
             .field("input", &self.input)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct JoinExpr<'a> {
+    pub left: Box<LogicalExpr<'a>>,
+    pub right: Box<LogicalExpr<'a>>,
+    pub predicate: super::cardinality::JoinPredicate,
+}
+
+impl<'a> fmt::Debug for JoinExpr<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Join")
+            .field("left", &self.left)
+            .field("right", &self.right)
+            .field("predicate", &self.predicate)
             .finish()
     }
 }
@@ -122,6 +142,15 @@ impl<'a> LogicalPlanBuilder<'a> {
         let input = Box::new(self.current);
         self.current = LogicalExpr::Filter(FilterExpr { predicate, input });
         self
+    }
+
+    pub fn join(left: LogicalPlan<'a>, right: LogicalPlan<'a>, predicate: JoinPredicate) -> Self {
+        let expr = LogicalExpr::Join(JoinExpr {
+            left: Box::new(left.root),
+            right: Box::new(right.root),
+            predicate,
+        });
+        Self { current: expr }
     }
 
     pub fn project(mut self, columns: SelectColumns) -> Self {
