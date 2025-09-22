@@ -8,6 +8,7 @@ use thiserror::Error;
 pub mod buffer;
 pub mod compression;
 pub mod distributed;
+pub mod memory;
 pub mod page;
 pub mod transaction;
 pub mod vacuum;
@@ -15,6 +16,7 @@ pub mod vacuum;
 pub use buffer::*;
 pub use compression::*;
 pub use distributed::*;
+pub use memory::*;
 pub use page::*;
 pub use transaction::*;
 pub use vacuum::*;
@@ -35,6 +37,10 @@ pub enum StorageEngineError {
     CompressionError(String),
     #[error("distributed transaction error: {0}")]
     DistributedTransaction(String),
+    #[error("collection not found: {0}")]
+    CollectionNotFound(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
 }
 
 pub type Result<T> = std::result::Result<T, StorageEngineError>;
