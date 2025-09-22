@@ -5,7 +5,9 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tokio::time::{Duration, Instant};
 
-use crate::{PageId, Result, StorageEngineError, TransactionId, TransactionSnapshot};
+use crate::{
+    PageId, Result, SnapshotManager, StorageEngineError, TransactionId, TransactionSnapshot,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionState {
@@ -534,7 +536,7 @@ pub struct TransactionManager {
     committed_transactions: RwLock<HashSet<TransactionId>>,
     aborted_transactions: RwLock<HashSet<TransactionId>>,
     lock_manager: Arc<LockManager>,
-    global_snapshot: RwLock<TransactionSnapshot>,
+    snapshot_manager: Arc<SnapshotManager>,
     config: TransactionManagerConfig,
 }
 
@@ -557,7 +559,7 @@ impl TransactionManager {
             committed_transactions: RwLock::new(HashSet::new()),
             aborted_transactions: RwLock::new(HashSet::new()),
             lock_manager: Arc::new(LockManager::new()),
-            global_snapshot: RwLock::new(initial_snapshot),
+            snapshot_manager: Arc::new(SnapshotManager::new(initial_snapshot)),
             config,
         }
     }
@@ -586,6 +588,8 @@ impl TransactionManager {
             snapshot,
         );
 
+        self.snapshot_manager
+            .register_snapshot(transaction.snapshot());
         self.active_transactions
             .write()
             .insert(xid, transaction.clone());
@@ -600,35 +604,13 @@ impl TransactionManager {
         isolation_level: IsolationLevel,
     ) -> TransactionSnapshot {
         let active_transactions = self.active_transactions.read();
-
-        match isolation_level {
-            IsolationLevel::ReadUncommitted => TransactionSnapshot {
-                xid,
-                active_xids: Arc::new(Vec::new()),
-                xmin: 0,
-                xmax: u64::MAX,
-            },
-            IsolationLevel::ReadCommitted => {
-                let mut active_xids: Vec<_> = active_transactions.keys().copied().collect();
-                active_xids.sort_unstable();
-                TransactionSnapshot {
-                    xid,
-                    active_xids: Arc::new(active_xids),
-                    xmin: active_transactions.keys().copied().min().unwrap_or(xid),
-                    xmax: xid,
-                }
-            }
-            IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
-                let mut active_xids: Vec<_> = active_transactions.keys().copied().collect();
-                active_xids.sort_unstable();
-                TransactionSnapshot {
-                    xid,
-                    active_xids: Arc::new(active_xids),
-                    xmin: active_transactions.keys().copied().min().unwrap_or(xid),
-                    xmax: xid,
-                }
-            }
-        }
+        let next_xid = self.next_xid.load(Ordering::Acquire);
+        self.snapshot_manager.create_snapshot(
+            xid,
+            isolation_level,
+            active_transactions.keys().copied(),
+            next_xid,
+        )
     }
 
     pub async fn commit(&self, mut transaction: Transaction) -> Result<()> {
@@ -651,6 +633,7 @@ impl TransactionManager {
         transaction.read_set.write().clear();
         transaction.write_set.write().clear();
 
+        self.snapshot_manager.release_snapshot(transaction.id);
         self.update_global_snapshot();
 
         Ok(())
@@ -666,6 +649,7 @@ impl TransactionManager {
         transaction.read_set.write().clear();
         transaction.write_set.write().clear();
 
+        self.snapshot_manager.release_snapshot(transaction.id);
         self.update_global_snapshot();
 
         Ok(())
@@ -692,17 +676,13 @@ impl TransactionManager {
 
     fn update_global_snapshot(&self) {
         let active_transactions = self.active_transactions.read();
-        let mut active_xids: Vec<_> = active_transactions.keys().copied().collect();
-        active_xids.sort_unstable();
+        let next_xid = self.next_xid.load(Ordering::Acquire);
+        self.snapshot_manager
+            .update_global_snapshot(active_transactions.keys().copied(), next_xid);
+    }
 
-        let mut global_snapshot = self.global_snapshot.write();
-        global_snapshot.active_xids = Arc::new(active_xids);
-        global_snapshot.xmin = active_transactions
-            .keys()
-            .copied()
-            .min()
-            .unwrap_or(global_snapshot.xmax);
-        global_snapshot.xmax = self.next_xid.load(Ordering::Acquire);
+    pub fn snapshot_manager(&self) -> Arc<SnapshotManager> {
+        self.snapshot_manager.clone()
     }
 
     pub async fn acquire_lock(
