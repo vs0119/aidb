@@ -2,12 +2,14 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use aidb_core::{Id, JsonValue, Vector};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod buffer;
 pub mod compression;
 pub mod distributed;
+pub mod index;
 pub mod page;
 pub mod transaction;
 pub mod vacuum;
@@ -15,6 +17,7 @@ pub mod vacuum;
 pub use buffer::*;
 pub use compression::*;
 pub use distributed::*;
+pub use index::*;
 pub use page::*;
 pub use transaction::*;
 pub use vacuum::*;
@@ -111,6 +114,7 @@ pub struct StorageEngine {
     pub compression_manager: Arc<CompressionManager>,
     pub vacuum_manager: Arc<VacuumManager>,
     pub stats: Arc<EngineStats>,
+    pub index_registry: Arc<DashMap<String, Arc<dyn IndexMaintenance>>>,
 }
 
 #[derive(Default)]
@@ -133,12 +137,15 @@ impl StorageEngine {
         data_dir: impl AsRef<std::path::Path>,
         config: transaction::TransactionManagerConfig,
     ) -> Result<Self> {
-        let buffer_pool = Arc::new(BufferPool::new(1024).await?);
-        let transaction_manager = Arc::new(TransactionManager::with_config(config));
         let page_manager = Arc::new(PageManager::new(data_dir).await?);
+        let mut buffer_pool = BufferPool::new(1024).await?;
+        buffer_pool.set_page_manager(page_manager.clone());
+        let buffer_pool = Arc::new(buffer_pool);
+        let transaction_manager = Arc::new(TransactionManager::with_config(config));
         let compression_manager = Arc::new(CompressionManager::new());
         let vacuum_manager = Arc::new(VacuumManager::new());
         let stats = Arc::new(EngineStats::default());
+        let index_registry = Arc::new(DashMap::new());
 
         Ok(Self {
             buffer_pool,
@@ -147,6 +154,7 @@ impl StorageEngine {
             compression_manager,
             vacuum_manager,
             stats,
+            index_registry,
         })
     }
 
@@ -161,6 +169,10 @@ impl StorageEngine {
         self.transaction_manager.begin_with_options(options).await
     }
 
+    pub fn register_index(&self, name: impl Into<String>, maintainer: Arc<dyn IndexMaintenance>) {
+        self.index_registry.insert(name.into(), maintainer);
+    }
+
     pub async fn insert_vector(
         &self,
         txn: &Transaction,
@@ -169,6 +181,11 @@ impl StorageEngine {
         payload: Option<JsonValue>,
     ) -> Result<RowId> {
         let row = VectorRow::new(id, vector, payload, txn.id);
+        let maintainers: Vec<_> = self
+            .index_registry
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
 
         let page_id = self.page_manager.allocate_page().await?;
         self.transaction_manager
@@ -177,11 +194,15 @@ impl StorageEngine {
         self.transaction_manager
             .register_page_access(txn, page_id, transaction::AccessMode::Write);
         let page = self.buffer_pool.get_page(page_id).await?;
-
-        let slot_id = page.write().await.insert_row(&row)?;
+        let mut page_guard = page.write().await;
+        let slot_id = page_guard.insert_row(&row)?;
+        drop(page_guard);
         let row_id = RowId { page_id, slot_id };
 
         self.stats.page_writes.fetch_add(1, Ordering::Relaxed);
+        for maintainer in maintainers {
+            maintainer.on_insert(&row, row_id).await?;
+        }
         Ok(row_id)
     }
 
@@ -215,6 +236,11 @@ impl StorageEngine {
         vector: Vector,
         payload: Option<JsonValue>,
     ) -> Result<()> {
+        let maintainers: Vec<_> = self
+            .index_registry
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
         self.transaction_manager
             .acquire_lock(txn, row_id.page_id, transaction::LockType::Exclusive)
             .await?;
@@ -233,18 +259,29 @@ impl StorageEngine {
                 ));
             }
 
+            let old_row = row.clone();
             row.vector = vector;
             row.payload = payload;
             row.updated_xid = Some(txn.id);
 
             page_guard.update_row(row_id.slot_id, &row)?;
             self.stats.page_writes.fetch_add(1, Ordering::Relaxed);
+            drop(page_guard);
+            for maintainer in maintainers {
+                maintainer.on_update(&old_row, &row, row_id).await?;
+            }
+            return Ok(());
         }
 
         Ok(())
     }
 
     pub async fn delete_vector(&self, txn: &Transaction, row_id: RowId) -> Result<bool> {
+        let maintainers: Vec<_> = self
+            .index_registry
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
         self.transaction_manager
             .acquire_lock(txn, row_id.page_id, transaction::LockType::Exclusive)
             .await?;
@@ -261,9 +298,14 @@ impl StorageEngine {
                 return Ok(false);
             }
 
+            let old_row = row.clone();
             row.deleted_xid = Some(txn.id);
             page_guard.update_row(row_id.slot_id, &row)?;
             self.stats.page_writes.fetch_add(1, Ordering::Relaxed);
+            drop(page_guard);
+            for maintainer in maintainers {
+                maintainer.on_delete(&old_row, row_id).await?;
+            }
 
             return Ok(true);
         }

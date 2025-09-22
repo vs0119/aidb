@@ -1,5 +1,6 @@
 use chrono::Datelike;
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use ordered_float::OrderedFloat;
 use roxmltree::Document;
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde_json::Value as JsonValue;
@@ -7,6 +8,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
@@ -33,6 +35,32 @@ pub enum Value {
     Xml(String),
     Geometry(Geometry),
     Null,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum OrderedValue {
+    Integer(i64),
+    Float(OrderedFloat<f64>),
+    Timestamp(DateTime<Utc>),
+}
+
+impl OrderedValue {
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Integer(v) => Some(OrderedValue::Integer(*v)),
+            Value::Float(v) => Some(OrderedValue::Float(OrderedFloat::from(*v))),
+            Value::Timestamp(ts) => Some(OrderedValue::Timestamp(*ts)),
+            _ => None,
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        match self {
+            OrderedValue::Integer(v) => Value::Integer(*v),
+            OrderedValue::Float(v) => Value::Float(**v),
+            OrderedValue::Timestamp(ts) => Value::Timestamp(*ts),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +106,7 @@ pub(crate) struct Table {
     pub(crate) jsonb_indexes: HashMap<usize, JsonIndex>,
     pub(crate) xml_indexes: HashMap<usize, XmlIndex>,
     pub(crate) spatial_indexes: HashMap<usize, SpatialIndex>,
+    pub(crate) btree_indexes: HashMap<usize, BTreeIndex>,
 }
 
 unsafe impl Send for Table {}
@@ -94,6 +123,7 @@ impl Default for Table {
             jsonb_indexes: HashMap::new(),
             xml_indexes: HashMap::new(),
             spatial_indexes: HashMap::new(),
+            btree_indexes: HashMap::new(),
         }
     }
 }
@@ -172,6 +202,11 @@ pub(crate) struct XmlIndex {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SpatialIndex {
     pub(crate) tree: RTree<SpatialIndexItem>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BTreeIndex {
+    pub(crate) map: BTreeMap<OrderedValue, Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1488,9 +1523,19 @@ impl SqlDatabase {
             return self.execute_external_select(projection, predicate, scan, cte_tables);
         }
         let table = scan.table.table;
-        let iter: Box<dyn Iterator<Item = usize>> = match scan.candidates.as_slice() {
-            Some(rows) => Box::new(rows.iter().copied()),
-            None => Box::new(0..table.rows.len()),
+        let index_candidates =
+            if let planner::ScanAccessPath::IndexScan(index_opts) = &scan.options.access_path {
+                btree_index_lookup(table, index_opts)?
+            } else {
+                None
+            };
+        let iter: Box<dyn Iterator<Item = usize>> = if let Some(indices) = index_candidates {
+            Box::new(indices.into_iter())
+        } else {
+            match scan.candidates.as_slice() {
+                Some(rows) => Box::new(rows.iter().copied()),
+                None => Box::new(0..table.rows.len()),
+            }
         };
 
         let mut matching_indices = Vec::new();
@@ -4192,6 +4237,7 @@ fn initialize_secondary_indexes(table: &mut Table) {
     table.jsonb_indexes.clear();
     table.xml_indexes.clear();
     table.spatial_indexes.clear();
+    table.btree_indexes.clear();
     for (idx, column) in table.columns.iter().enumerate() {
         match column.ty {
             ColumnType::Json => {
@@ -4205,6 +4251,9 @@ fn initialize_secondary_indexes(table: &mut Table) {
             }
             ColumnType::Geometry => {
                 table.spatial_indexes.insert(idx, SpatialIndex::default());
+            }
+            ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp => {
+                table.btree_indexes.insert(idx, BTreeIndex::default());
             }
             _ => {}
         }
@@ -4223,6 +4272,9 @@ fn rebuild_secondary_indexes(table: &mut Table) {
     }
     for index in table.spatial_indexes.values_mut() {
         index.tree = RTree::new();
+    }
+    for index in table.btree_indexes.values_mut() {
+        index.map.clear();
     }
     for row_index in 0..table.rows.len() {
         update_indexes_for_row(table, row_index);
@@ -4257,6 +4309,13 @@ fn update_indexes_for_row(table: &mut Table, row_index: usize) {
                 row: row_index,
                 bbox,
             });
+        }
+    }
+    for (col_idx, index) in table.btree_indexes.iter_mut() {
+        if let Some(value) = row.get(*col_idx) {
+            if let Some(key) = OrderedValue::from_value(value) {
+                index.map.entry(key).or_default().push(row_index);
+            }
         }
     }
 }
@@ -6487,4 +6546,74 @@ mod tests {
         let after_fourth = db.cache_stats();
         assert_eq!(after_fourth.misses, before_manual_invalidation.misses + 1);
     }
+}
+
+fn btree_index_lookup(
+    table: &Table,
+    options: &planner::IndexScanOptions,
+) -> Result<Option<Vec<usize>>, SqlDatabaseError> {
+    let idx = column_index_in_table(table, &options.column)?;
+    let Some(index) = table.btree_indexes.get(&idx) else {
+        return Ok(None);
+    };
+    let lower_key = options
+        .lower_bound
+        .as_ref()
+        .and_then(|value| OrderedValue::from_value(value));
+    let upper_key = options
+        .upper_bound
+        .as_ref()
+        .and_then(|value| OrderedValue::from_value(value));
+    if options.lower_bound.is_some() && lower_key.is_none() {
+        return Ok(None);
+    }
+    if options.upper_bound.is_some() && upper_key.is_none() {
+        return Ok(None);
+    }
+    let mut rows = Vec::new();
+    match (lower_key, upper_key) {
+        (Some(lower), Some(upper)) => {
+            let lower_bound = if options.lower_inclusive {
+                Included(lower)
+            } else {
+                Excluded(lower)
+            };
+            let upper_bound = if options.upper_inclusive {
+                Included(upper)
+            } else {
+                Excluded(upper)
+            };
+            for (_, bucket) in index.map.range((lower_bound, upper_bound)) {
+                rows.extend(bucket.iter().copied());
+            }
+        }
+        (Some(lower), None) => {
+            let lower_bound = if options.lower_inclusive {
+                Included(lower)
+            } else {
+                Excluded(lower)
+            };
+            for (_, bucket) in index.map.range((lower_bound, Unbounded)) {
+                rows.extend(bucket.iter().copied());
+            }
+        }
+        (None, Some(upper)) => {
+            let upper_bound = if options.upper_inclusive {
+                Included(upper)
+            } else {
+                Excluded(upper)
+            };
+            for (_, bucket) in index.map.range((Unbounded, upper_bound)) {
+                rows.extend(bucket.iter().copied());
+            }
+        }
+        (None, None) => {
+            for bucket in index.map.values() {
+                rows.extend(bucket.iter().copied());
+            }
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    Ok(Some(rows))
 }

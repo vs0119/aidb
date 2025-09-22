@@ -3,7 +3,7 @@ use crate::{Predicate, SelectColumns};
 
 use super::cardinality::{CardinalityEstimate, CardinalityEstimator, JoinPredicate};
 use super::context::PlanContext;
-use super::logical::{ScanCandidates, ScanOptions};
+use super::logical::{IndexScanOptions, ScanAccessPath, ScanCandidates, ScanOptions};
 
 #[derive(Debug, Clone, Copy)]
 pub struct CostEstimate {
@@ -100,6 +100,16 @@ impl CostModel {
             context.statistics().average_row_width()
         };
 
+        if let ScanAccessPath::IndexScan(index_opts) = &options.access_path {
+            return self.estimate_index_scan(
+                context,
+                candidates,
+                row_width,
+                cardinality,
+                index_opts,
+            );
+        }
+
         if let Some(connector) = context.external() {
             let factors = connector.cost_factors();
             if let Some(pred) = options.pushdown_predicate.as_ref() {
@@ -133,6 +143,43 @@ impl CostModel {
 
         CostEstimate {
             cardinality,
+            cpu_cost,
+            io_cost,
+        }
+    }
+
+    fn estimate_index_scan(
+        &self,
+        _context: &PlanContext<'_>,
+        candidates: &ScanCandidates,
+        row_width: f64,
+        base_cardinality: CardinalityEstimate,
+        options: &IndexScanOptions,
+    ) -> CostEstimate {
+        let mut cardinality = base_cardinality;
+        if matches!(candidates, ScanCandidates::Fixed(rows) if !rows.is_empty()) {
+            cardinality = CardinalityEstimate::new(rows.len() as f64, 0.95);
+        }
+        let selectivity = options.estimated_selectivity.clamp(0.0, 1.0);
+        let estimated_rows = (cardinality.estimated_rows * selectivity)
+            .max(1.0)
+            .min(cardinality.estimated_rows);
+        let confidence = (cardinality.confidence + 0.1).min(0.99);
+        let mut adjusted_row_width = row_width;
+        if options.covering {
+            adjusted_row_width = (row_width * 0.3).max(8.0);
+        }
+        let traversal_cost = self.io_cost_per_page * 3.0;
+        let data_io = if adjusted_row_width <= 0.0 {
+            0.0
+        } else {
+            ((estimated_rows * adjusted_row_width) / self.page_size_bytes) * self.io_cost_per_page
+        };
+        let io_cost = traversal_cost + data_io;
+        let cpu_multiplier = if options.covering { 0.25 } else { 0.5 };
+        let cpu_cost = estimated_rows * self.cpu_cost_per_row * cpu_multiplier;
+        CostEstimate {
+            cardinality: CardinalityEstimate::new(estimated_rows, confidence),
             cpu_cost,
             io_cost,
         }

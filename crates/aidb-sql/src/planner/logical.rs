@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{Predicate, SelectColumns};
+use crate::{Predicate, SelectColumns, Value};
 
 use super::cardinality::JoinPredicate;
 use super::table_ref::ResolvedTable;
@@ -103,6 +103,30 @@ impl<'a> fmt::Debug for ScanExpr<'a> {
 pub struct ScanOptions {
     pub pushdown_predicate: Option<Predicate>,
     pub projected_columns: Option<SelectColumns>,
+    pub access_path: ScanAccessPath,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScanAccessPath {
+    SeqScan,
+    IndexScan(IndexScanOptions),
+}
+
+impl Default for ScanAccessPath {
+    fn default() -> Self {
+        ScanAccessPath::SeqScan
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexScanOptions {
+    pub column: String,
+    pub lower_bound: Option<Value>,
+    pub upper_bound: Option<Value>,
+    pub lower_inclusive: bool,
+    pub upper_inclusive: bool,
+    pub estimated_selectivity: f64,
+    pub covering: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

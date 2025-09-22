@@ -59,6 +59,17 @@ pub struct PlanContext<'a> {
     stats: PlanStatistics,
     external: Option<&'a dyn ExternalSource>,
     cost: CostParameters,
+    indexes: HashMap<String, BTreeIndexInfo>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BTreeIndexInfo {
+    pub column: String,
+    pub distinct_keys: usize,
+    pub total_rows: usize,
+    pub min_value: Option<Value>,
+    pub max_value: Option<Value>,
+    pub covering: bool,
 }
 
 impl<'a> PlanContext<'a> {
@@ -75,11 +86,13 @@ impl<'a> PlanContext<'a> {
             table_stats,
             column_stats,
         );
+        let indexes = build_btree_metadata(table.table);
         Self {
             table,
             stats,
             external,
             cost: CostParameters::default(),
+            indexes,
         }
     }
 
@@ -98,6 +111,10 @@ impl<'a> PlanContext<'a> {
 
     pub fn cost_parameters(&self) -> CostParameters {
         self.cost
+    }
+
+    pub fn index_for_column(&self, column: &str) -> Option<&BTreeIndexInfo> {
+        self.indexes.get(&column.to_ascii_lowercase())
     }
 
     pub fn projected_row_width(&self, columns: &SelectColumns) -> f64 {
@@ -128,6 +145,30 @@ fn approximate_row_width(table: &Table) -> f64 {
         .map(|row| row.iter().map(estimate_value_size).sum::<usize>())
         .sum();
     (total as f64) / (sample_size as f64)
+}
+
+fn build_btree_metadata(table: &Table) -> HashMap<String, BTreeIndexInfo> {
+    let mut map = HashMap::new();
+    for (idx, index) in &table.btree_indexes {
+        if index.map.is_empty() {
+            continue;
+        }
+        let column = table.columns[*idx].name.clone();
+        let min_value = index.map.keys().next().map(|value| value.to_value());
+        let max_value = index.map.keys().next_back().map(|value| value.to_value());
+        map.insert(
+            column.to_ascii_lowercase(),
+            BTreeIndexInfo {
+                column,
+                distinct_keys: index.map.len(),
+                total_rows: table.rows.len(),
+                min_value,
+                max_value,
+                covering: false,
+            },
+        );
+    }
+    map
 }
 
 fn estimate_value_size(value: &Value) -> usize {
