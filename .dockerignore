@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+target/
+**/target/
+
+# macOS app (not needed for server deployment)
+apps/
+
+# IDE files
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.swp
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Documentation (optional)
+*.md
+docs/
+
+# Test artifacts
+test-results/
+coverage/

@@ -13,6 +13,7 @@ use thiserror::Error;
 
 mod execution;
 mod external;
+mod jit;
 mod planner;
 
 use execution::TaskScheduler;
@@ -312,6 +313,7 @@ pub struct SqlDatabase {
     execution_config: ExecutionConfig,
     scheduler: Option<Arc<TaskScheduler>>,
     execution_stats: Arc<Mutex<ExecutionStats>>,
+    jit_manager: RefCell<jit::JitManager>,
 }
 
 struct ExternalTableEntry {
@@ -430,6 +432,12 @@ pub enum SqlDatabaseError {
     SystemTableModification(String),
     #[error("unsupported statement")]
     Unsupported,
+    #[error("JIT compilation failed: {0}")]
+    JitCompilation(String),
+    #[error("JIT operation not supported")]
+    JitUnsupported,
+    #[error("column '{0}' not found")]
+    ColumnNotFound(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -541,6 +549,7 @@ impl SqlDatabase {
             execution_config,
             scheduler,
             execution_stats: stats,
+            jit_manager: RefCell::new(jit::JitManager::new()),
         };
         db.initialize_system_catalog();
         db

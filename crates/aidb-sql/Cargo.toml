@@ -13,3 +13,11 @@ roxmltree = "0.20"
 rstar = "0.11"
 crossbeam.workspace = true
 num_cpus.workspace = true
+
+# JIT compilation dependencies (placeholder - add when implementing full Cranelift integration)
+# cranelift-codegen = "0.104"
+# cranelift-frontend = "0.104"
+# cranelift-module = "0.104"
+# cranelift-jit = "0.104"
+# cranelift-native = "0.104"
+# target-lexicon = "0.12"

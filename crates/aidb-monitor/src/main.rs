@@ -200,8 +200,17 @@ async fn simulate_traced_request(tracing_system: &TracingSystem) {
     let methods = ["GET", "POST", "PUT", "DELETE"];
     let paths = ["/search", "/collections", "/health", "/metrics"];
 
-    let method = methods[rand::random::<usize>() % methods.len()];
-    let path = paths[rand::random::<usize>() % paths.len()];
+    // Select randomly before the async operation to avoid Send issues
+    let method = {
+        use rand::prelude::IndexedRandom;
+        let mut rng = rand::rng();
+        *methods.choose(&mut rng).unwrap()
+    };
+    let path = {
+        use rand::prelude::IndexedRandom;
+        let mut rng = rand::rng();
+        *paths.choose(&mut rng).unwrap()
+    };
 
     let _ = trace_http_request(tracing_system, method, path).await;
 }
