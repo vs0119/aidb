@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::{PlanCacheKey, SqlDatabaseError};
+use super::PlanCacheKey;
 
 /// JIT compilation manager for SQL query hot paths
 /// Currently a placeholder implementation that can be extended with full Cranelift integration
@@ -14,7 +14,7 @@ pub(crate) struct JitManager {
 }
 
 #[derive(Debug)]
-struct CompiledFilter {
+pub(crate) struct CompiledFilter {
     // Future: Store compiled machine code
     _placeholder: bool,
 }

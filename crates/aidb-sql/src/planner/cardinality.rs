@@ -228,7 +228,7 @@ impl<'a> CardinalityEstimator<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JoinPredicate {
     pub left_column: String,
     pub right_column: String,

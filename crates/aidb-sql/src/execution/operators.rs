@@ -1,4 +1,4 @@
-use super::batch::ColumnarBatch;
+use super::batch::{ColumnVector, ColumnarBatch};
 use crate::planner::ScanCandidates;
 use crate::{compare_values, equal, full_text_matches, ColumnType, Table, Value};
 
@@ -106,98 +106,30 @@ pub(crate) fn apply_predicate(batch: &mut ColumnarBatch<'_>, predicate: &BatchPr
     if batch.is_empty() {
         return;
     }
-    let mask: Vec<bool> = match predicate {
+    let mask = match predicate {
         BatchPredicate::Equals {
             column_index,
             value,
-        } => {
-            let column = batch.column(*column_index);
-            column
-                .values()
-                .iter()
-                .map(|candidate| equal(candidate, value))
-                .collect()
-        }
+        } => equals_mask(batch.column(*column_index), value),
         BatchPredicate::GreaterOrEqual {
             column_index,
             value,
-        } => {
-            let column = batch.column(*column_index);
-            column
-                .values()
-                .iter()
-                .map(|candidate| {
-                    if matches!(candidate, Value::Null) {
-                        return false;
-                    }
-                    matches!(
-                        compare_values(candidate, value),
-                        Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
-                    )
-                })
-                .collect()
-        }
+        } => greater_equal_mask(batch.column(*column_index), value),
         BatchPredicate::Between {
             column_index,
             low,
             high,
-        } => {
-            let column = batch.column(*column_index);
-            column
-                .values()
-                .iter()
-                .map(|candidate| {
-                    if matches!(candidate, Value::Null) {
-                        return false;
-                    }
-                    let cmp_low = compare_values(candidate, low);
-                    let cmp_high = compare_values(candidate, high);
-                    matches!(
-                        cmp_low,
-                        Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
-                    ) && matches!(
-                        cmp_high,
-                        Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
-                    )
-                })
-                .collect()
-        }
-        BatchPredicate::IsNull { column_index } => {
-            let column = batch.column(*column_index);
-            column
-                .values()
-                .iter()
-                .map(|candidate| matches!(candidate, Value::Null))
-                .collect()
-        }
+        } => between_mask(batch.column(*column_index), low, high),
+        BatchPredicate::IsNull { column_index } => null_mask(batch.column(*column_index)),
         BatchPredicate::InTableColumn {
             column_index,
             lookup_values,
-        } => {
-            let column = batch.column(*column_index);
-            column
-                .values()
-                .iter()
-                .map(|candidate| {
-                    if matches!(candidate, Value::Null) {
-                        return false;
-                    }
-                    lookup_values.iter().any(|value| equal(candidate, value))
-                })
-                .collect()
-        }
+        } => in_list_mask(batch.column(*column_index), lookup_values),
         BatchPredicate::FullText {
             column_index,
             query,
             language,
-        } => {
-            let column = batch.column(*column_index);
-            column
-                .values()
-                .iter()
-                .map(|candidate| full_text_matches(candidate, query, language.as_deref()))
-                .collect()
-        }
+        } => full_text_mask(batch.column(*column_index), query, language.as_deref()),
     };
     if mask.iter().all(|keep| *keep) {
         return;
@@ -209,22 +141,210 @@ pub(crate) fn apply_predicate(batch: &mut ColumnarBatch<'_>, predicate: &BatchPr
     batch.retain_by_mask(&mask);
 }
 
-pub(crate) fn append_rows(batch: &ColumnarBatch<'_>, output: &mut Vec<Vec<Value>>) {
-    if batch.is_empty() {
-        return;
-    }
-    let column_count = batch.column_count();
-    for row_idx in 0..batch.len() {
-        let mut row = Vec::with_capacity(column_count);
-        for column in batch.columns() {
-            row.push(column.value(row_idx).clone());
-        }
-        output.push(row);
+pub(crate) fn collect_rows(batch: &ColumnarBatch<'_>) -> Vec<Vec<Value>> {
+    batch.to_rows()
+}
+
+fn equals_mask(column: &ColumnVector<'_>, value: &Value) -> Vec<bool> {
+    match value {
+        Value::Integer(target) => fast_equals_integer(column, *target),
+        Value::Float(target) => fast_equals_float(column, *target),
+        _ => column
+            .values()
+            .iter()
+            .map(|candidate| equal(candidate, value))
+            .collect(),
     }
 }
 
-pub(crate) fn collect_rows(batch: &ColumnarBatch<'_>) -> Vec<Vec<Value>> {
-    let mut rows = Vec::new();
-    append_rows(batch, &mut rows);
-    rows
+fn greater_equal_mask(column: &ColumnVector<'_>, value: &Value) -> Vec<bool> {
+    match value {
+        Value::Integer(target) => fast_compare_integer_ge(column, *target),
+        Value::Float(target) => fast_compare_float_ge(column, *target),
+        _ => column
+            .values()
+            .iter()
+            .map(|candidate| {
+                if matches!(candidate, Value::Null) {
+                    return false;
+                }
+                matches!(
+                    compare_values(candidate, value),
+                    Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
+                )
+            })
+            .collect(),
+    }
+}
+
+fn between_mask(column: &ColumnVector<'_>, low: &Value, high: &Value) -> Vec<bool> {
+    if matches!(low, Value::Integer(_)) && matches!(high, Value::Integer(_)) {
+        let low = match low {
+            Value::Integer(v) => *v,
+            _ => unreachable!(),
+        };
+        let high = match high {
+            Value::Integer(v) => *v,
+            _ => unreachable!(),
+        };
+        return fast_between_integer(column, low, high);
+    }
+    if matches!(low, Value::Float(_)) && matches!(high, Value::Float(_)) {
+        let low = match low {
+            Value::Float(v) => *v,
+            _ => unreachable!(),
+        };
+        let high = match high {
+            Value::Float(v) => *v,
+            _ => unreachable!(),
+        };
+        return fast_between_float(column, low, high);
+    }
+    column
+        .values()
+        .iter()
+        .map(|candidate| {
+            if matches!(candidate, Value::Null) {
+                return false;
+            }
+            let cmp_low = compare_values(candidate, low);
+            let cmp_high = compare_values(candidate, high);
+            matches!(
+                cmp_low,
+                Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
+            ) && matches!(
+                cmp_high,
+                Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
+            )
+        })
+        .collect()
+}
+
+fn null_mask(column: &ColumnVector<'_>) -> Vec<bool> {
+    column
+        .values()
+        .iter()
+        .map(|candidate| matches!(candidate, Value::Null))
+        .collect()
+}
+
+fn in_list_mask(column: &ColumnVector<'_>, lookup_values: &[Value]) -> Vec<bool> {
+    column
+        .values()
+        .iter()
+        .map(|candidate| {
+            if matches!(candidate, Value::Null) {
+                return false;
+            }
+            lookup_values.iter().any(|value| equal(candidate, value))
+        })
+        .collect()
+}
+
+fn full_text_mask(column: &ColumnVector<'_>, query: &str, language: Option<&str>) -> Vec<bool> {
+    column
+        .values()
+        .iter()
+        .map(|candidate| full_text_matches(candidate, query, language))
+        .collect()
+}
+
+fn fast_equals_integer(column: &ColumnVector<'_>, target: i64) -> Vec<bool> {
+    let values = column.values();
+    let mut mask = Vec::with_capacity(column.len());
+    let mut chunks = values.chunks_exact(4);
+    for chunk in &mut chunks {
+        for value in chunk {
+            match value {
+                Value::Integer(i) => mask.push(*i == target),
+                Value::Null => mask.push(false),
+                _ => mask.push(equal(value, &Value::Integer(target))),
+            }
+        }
+    }
+    for value in chunks.remainder() {
+        match value {
+            Value::Integer(i) => mask.push(*i == target),
+            Value::Null => mask.push(false),
+            _ => mask.push(equal(value, &Value::Integer(target))),
+        }
+    }
+    mask
+}
+
+fn fast_equals_float(column: &ColumnVector<'_>, target: f64) -> Vec<bool> {
+    let values = column.values();
+    let mut mask = Vec::with_capacity(column.len());
+    let mut chunks = values.chunks_exact(4);
+    for chunk in &mut chunks {
+        for value in chunk {
+            match value {
+                Value::Float(f) => mask.push((*f - target).abs() <= f64::EPSILON),
+                Value::Null => mask.push(false),
+                _ => mask.push(equal(value, &Value::Float(target))),
+            }
+        }
+    }
+    for value in chunks.remainder() {
+        match value {
+            Value::Float(f) => mask.push((*f - target).abs() <= f64::EPSILON),
+            Value::Null => mask.push(false),
+            _ => mask.push(equal(value, &Value::Float(target))),
+        }
+    }
+    mask
+}
+
+fn fast_compare_integer_ge(column: &ColumnVector<'_>, target: i64) -> Vec<bool> {
+    let mut mask = Vec::with_capacity(column.len());
+    for value in column.values() {
+        match value {
+            Value::Integer(i) => mask.push(*i >= target),
+            Value::Null => mask.push(false),
+            _ => mask.push(matches!(
+                compare_values(value, &Value::Integer(target)),
+                Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
+            )),
+        }
+    }
+    mask
+}
+
+fn fast_compare_float_ge(column: &ColumnVector<'_>, target: f64) -> Vec<bool> {
+    let mut mask = Vec::with_capacity(column.len());
+    for value in column.values() {
+        match value {
+            Value::Float(f) => mask.push(*f >= target),
+            Value::Null => mask.push(false),
+            _ => mask.push(matches!(
+                compare_values(value, &Value::Float(target)),
+                Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
+            )),
+        }
+    }
+    mask
+}
+
+fn fast_between_integer(column: &ColumnVector<'_>, low: i64, high: i64) -> Vec<bool> {
+    let mut mask = Vec::with_capacity(column.len());
+    for value in column.values() {
+        match value {
+            Value::Integer(i) => mask.push(*i >= low && *i <= high),
+            Value::Null => mask.push(false),
+            _ => mask.push(false),
+        }
+    }
+    mask
+}
+
+fn fast_between_float(column: &ColumnVector<'_>, low: f64, high: f64) -> Vec<bool> {
+    let mut mask = Vec::with_capacity(column.len());
+    for value in column.values() {
+        match value {
+            Value::Float(f) => mask.push(*f >= low && *f <= high),
+            Value::Null => mask.push(false),
+            _ => mask.push(false),
+        }
+    }
+    mask
 }

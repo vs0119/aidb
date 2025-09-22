@@ -2121,6 +2121,7 @@ impl SqlDatabase {
                 let shape = format!("filter:{predicate_shape}|{input_shape}");
                 Some((shape, dependencies))
             }
+            planner::LogicalExpr::Join(_) => None,
             planner::LogicalExpr::Scan(scan) => match scan.table.source {
                 planner::TableSource::Cte => None,
                 planner::TableSource::External => None,
