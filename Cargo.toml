@@ -20,7 +20,7 @@ rust-version = "1.70"
 
 [workspace.dependencies]
 anyhow = "1"
-bincode = "1"
+bincode = "2"
 env_logger = "0.10"
 log = "0.4"
 parking_lot = "0.12"
