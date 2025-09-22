@@ -41,7 +41,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 num_cpus = "1.16"
-dashmap = "5.5"
+dashmap = "6.1"
 memmap2 = "0.9"
 crossbeam = "0.8"
 atomic = "0.6"
