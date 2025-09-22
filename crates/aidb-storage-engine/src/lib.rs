@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod buffer;
+pub mod columnar;
 pub mod compression;
 pub mod distributed;
 pub mod page;
@@ -13,6 +14,7 @@ pub mod transaction;
 pub mod vacuum;
 
 pub use buffer::*;
+pub use columnar::*;
 pub use compression::*;
 pub use distributed::*;
 pub use page::*;
