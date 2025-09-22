@@ -79,9 +79,10 @@ impl<'a> fmt::Debug for ScanExpr<'a> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScanOptions {
     pub pushdown_predicate: Option<Predicate>,
+    pub projected_columns: Option<SelectColumns>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

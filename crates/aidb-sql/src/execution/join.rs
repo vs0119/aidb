@@ -1,7 +1,10 @@
-use super::operators::ScanPartition;
+use super::operators::{partition_scan_candidates, ScanPartition};
 use super::scheduler::TaskScheduler;
 use crate::planner::{JoinPredicate, JoinType, ScanCandidates};
-use crate::{canonical_json, column_index_in_table, equal, ExecutionStats, Geometry, SqlDatabaseError, Table, Value};
+use crate::{
+    canonical_json, column_index_in_table, equal, ExecutionStats, Geometry, SqlDatabaseError,
+    Table, Value,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

@@ -2,12 +2,12 @@ use std::ops::Bound::Included;
 
 use crate::{
     canonical_json, coerce_static_value, column_index_in_table, xml_root_name, ColumnType,
-    SqlDatabaseError, Value,
+    SelectColumns, SqlDatabaseError, Value,
 };
 
 use super::context::PlanContext;
-use super::logical::ScanCandidates;
-use super::memo::{Memo, MemoExpr};
+use super::logical::{ScanCandidates, ScanOptions};
+use super::memo::{GroupId, Memo, MemoExpr};
 use super::rules::RewriteRule;
 use super::table_ref::ResolvedTable;
 
@@ -37,35 +37,264 @@ impl<'a> RewriteRule<'a> for BaselineScanRule {
                 }
             };
 
-            let scan_expr_id = memo.group(child_group).expressions[0];
-            {
-                let scan_expr = memo.expression_mut(scan_expr_id);
-                if let MemoExpr::Scan {
+            let scan_exprs: Vec<_> = memo.group(child_group).expressions.clone();
+            for scan_expr_id in scan_exprs {
+                let scan_expr = memo.expression(scan_expr_id);
+                let MemoExpr::Scan {
                     table,
                     candidates,
                     options,
-                } = &mut scan_expr.expr
-                {
-                    if matches!(table.source, super::table_ref::TableSource::External) {
-                        if let Some(connector) = context.external() {
-                            if connector.supports_predicate_pushdown(&predicate) {
-                                if options.pushdown_predicate.as_ref() != Some(&predicate) {
-                                    options.pushdown_predicate = Some(predicate.clone());
-                                    changed = true;
-                                }
+                } = &scan_expr.expr
+                else {
+                    continue;
+                };
+
+                if matches!(table.source, super::table_ref::TableSource::External) {
+                    if let Some(connector) = context.external() {
+                        if connector.supports_predicate_pushdown(&predicate) {
+                            let mut new_options = options.clone();
+                            if new_options.pushdown_predicate.as_ref() == Some(&predicate) {
+                                continue;
+                            }
+                            new_options.pushdown_predicate = Some(predicate.clone());
+                            let new_expr = MemoExpr::Scan {
+                                table: *table,
+                                candidates: candidates.clone(),
+                                options: new_options,
+                            };
+                            if memo
+                                .add_expression_to_group(
+                                    memo.expression_group(scan_expr_id),
+                                    new_expr,
+                                )
+                                .is_some()
+                            {
+                                changed = true;
                             }
                         }
-                        continue;
                     }
-                    if !candidates.is_all() {
-                        continue;
-                    }
-                    let computed = compute_candidate_rows(*table, &predicate)?;
-                    if let Some(rows) = computed {
-                        *candidates = ScanCandidates::Fixed(rows);
+                    continue;
+                }
+
+                if !candidates.is_all() {
+                    continue;
+                }
+
+                let computed = compute_candidate_rows(*table, &predicate)?;
+                if let Some(rows) = computed {
+                    let new_expr = MemoExpr::Scan {
+                        table: *table,
+                        candidates: ScanCandidates::Fixed(rows),
+                        options: options.clone(),
+                    };
+                    if memo
+                        .add_expression_to_group(memo.expression_group(scan_expr_id), new_expr)
+                        .is_some()
+                    {
                         changed = true;
                     }
                 }
+            }
+        }
+
+        Ok(changed)
+    }
+}
+
+pub struct FilterPushdownRule;
+
+impl FilterPushdownRule {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn pushdown_into_group(
+        &self,
+        memo: &mut Memo<'_>,
+        context: &PlanContext<'_>,
+        predicate: &crate::Predicate,
+        group_id: GroupId,
+    ) -> Result<bool, SqlDatabaseError> {
+        let expr_ids: Vec<_> = memo.group(group_id).expressions.clone();
+        let mut changed = false;
+
+        for expr_id in expr_ids {
+            let expr = memo.expression(expr_id).expr.clone();
+            match expr {
+                MemoExpr::Projection { columns, input } => {
+                    if columns.includes_column(predicate.column_name()) {
+                        if self.pushdown_into_group(memo, context, predicate, input)? {
+                            changed = true;
+                        }
+                    }
+                }
+                MemoExpr::Filter { input, .. } => {
+                    if self.pushdown_into_group(memo, context, predicate, input)? {
+                        changed = true;
+                    }
+                }
+                MemoExpr::Scan {
+                    table,
+                    candidates,
+                    options,
+                } => {
+                    if self.pushdown_to_scan(
+                        memo, context, predicate, expr_id, table, candidates, options,
+                    )? {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        Ok(changed)
+    }
+
+    fn pushdown_to_scan<'a>(
+        &self,
+        memo: &mut Memo<'a>,
+        context: &PlanContext<'_>,
+        predicate: &crate::Predicate,
+        expr_id: super::memo::ExprId,
+        table: ResolvedTable<'a>,
+        candidates: ScanCandidates,
+        options: ScanOptions,
+    ) -> Result<bool, SqlDatabaseError> {
+        if !matches!(table.source, super::table_ref::TableSource::External) {
+            return Ok(false);
+        }
+
+        let Some(connector) = context.external() else {
+            return Ok(false);
+        };
+        if !connector.supports_predicate_pushdown(predicate) {
+            return Ok(false);
+        }
+        if options.pushdown_predicate.as_ref() == Some(predicate) {
+            return Ok(false);
+        }
+        let mut new_options = options.clone();
+        new_options.pushdown_predicate = Some(predicate.clone());
+        let new_expr = MemoExpr::Scan {
+            table,
+            candidates,
+            options: new_options,
+        };
+        Ok(memo
+            .add_expression_to_group(memo.expression_group(expr_id), new_expr)
+            .is_some())
+    }
+}
+
+impl<'a> RewriteRule<'a> for FilterPushdownRule {
+    fn apply(
+        &self,
+        memo: &mut Memo<'a>,
+        context: &PlanContext<'a>,
+    ) -> Result<bool, SqlDatabaseError> {
+        let expr_ids: Vec<_> = memo.expressions().map(|expr| expr.id).collect();
+        let mut changed = false;
+
+        for expr_id in expr_ids {
+            let (predicate, child_group) = {
+                let expr = memo.expression(expr_id);
+                match &expr.expr {
+                    MemoExpr::Filter { predicate, input } => (predicate.clone(), *input),
+                    _ => continue,
+                }
+            };
+            if self.pushdown_into_group(memo, context, &predicate, child_group)? {
+                changed = true;
+            }
+        }
+
+        Ok(changed)
+    }
+}
+
+pub struct ProjectionPushdownRule;
+
+impl ProjectionPushdownRule {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn pushdown_columns(
+        &self,
+        memo: &mut Memo<'_>,
+        columns: &SelectColumns,
+        group_id: GroupId,
+    ) -> bool {
+        let expr_ids: Vec<_> = memo.group(group_id).expressions.clone();
+        let mut changed = false;
+
+        for expr_id in expr_ids {
+            let expr = memo.expression(expr_id).expr.clone();
+            match expr {
+                MemoExpr::Filter { input, .. } => {
+                    if self.pushdown_columns(memo, columns, input) {
+                        changed = true;
+                    }
+                }
+                MemoExpr::Projection { input, .. } => {
+                    if self.pushdown_columns(memo, columns, input) {
+                        changed = true;
+                    }
+                }
+                MemoExpr::Scan {
+                    table,
+                    candidates,
+                    options,
+                } => {
+                    if let Some(existing) = options.projected_columns.as_ref() {
+                        if existing == columns {
+                            continue;
+                        }
+                    }
+                    if columns.is_all() {
+                        continue;
+                    }
+                    let mut new_options = options.clone();
+                    new_options.projected_columns = Some(columns.clone());
+                    let new_expr = MemoExpr::Scan {
+                        table,
+                        candidates,
+                        options: new_options,
+                    };
+                    if memo
+                        .add_expression_to_group(memo.expression_group(expr_id), new_expr)
+                        .is_some()
+                    {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+}
+
+impl<'a> RewriteRule<'a> for ProjectionPushdownRule {
+    fn apply(
+        &self,
+        memo: &mut Memo<'a>,
+        _context: &PlanContext<'a>,
+    ) -> Result<bool, SqlDatabaseError> {
+        let expr_ids: Vec<_> = memo.expressions().map(|expr| expr.id).collect();
+        let mut changed = false;
+
+        for expr_id in expr_ids {
+            let (columns, child_group) = {
+                let expr = memo.expression(expr_id);
+                match &expr.expr {
+                    MemoExpr::Projection { columns, input } => (columns.clone(), *input),
+                    _ => continue,
+                }
+            };
+
+            if self.pushdown_columns(memo, &columns, child_group) {
+                changed = true;
             }
         }
 

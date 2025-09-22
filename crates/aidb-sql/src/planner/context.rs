@@ -1,8 +1,9 @@
 #![cfg_attr(not(test), allow(dead_code))]
 use std::collections::HashMap;
 
-use crate::{ColumnStatistics, ExternalSource, Table, TableStatistics, Value};
+use crate::{ColumnStatistics, ExternalSource, SelectColumns, Table, TableStatistics, Value};
 
+use super::cost::CostParameters;
 use super::table_ref::ResolvedTable;
 
 #[derive(Clone)]
@@ -57,6 +58,7 @@ pub struct PlanContext<'a> {
     pub table: ResolvedTable<'a>,
     stats: PlanStatistics,
     external: Option<&'a dyn ExternalSource>,
+    cost: CostParameters,
 }
 
 impl<'a> PlanContext<'a> {
@@ -77,6 +79,7 @@ impl<'a> PlanContext<'a> {
             table,
             stats,
             external,
+            cost: CostParameters::default(),
         }
     }
 
@@ -86,6 +89,29 @@ impl<'a> PlanContext<'a> {
 
     pub fn external(&self) -> Option<&'a dyn ExternalSource> {
         self.external
+    }
+
+    pub fn with_cost_parameters(mut self, params: CostParameters) -> Self {
+        self.cost = params;
+        self
+    }
+
+    pub fn cost_parameters(&self) -> CostParameters {
+        self.cost
+    }
+
+    pub fn projected_row_width(&self, columns: &SelectColumns) -> f64 {
+        match columns {
+            SelectColumns::All => self.statistics().average_row_width(),
+            SelectColumns::Some(items) => {
+                if items.is_empty() {
+                    return 0.0;
+                }
+                let total_columns = self.table.table.columns.len().max(1) as f64;
+                let ratio = (items.len() as f64 / total_columns).clamp(0.0, 1.0);
+                self.statistics().average_row_width() * ratio
+            }
+        }
     }
 }
 

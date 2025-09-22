@@ -13,7 +13,8 @@ pub use cardinality::{CardinalityEstimate, CardinalityEstimator, JoinPredicate, 
 pub use context::{PlanContext, PlanStatistics};
 #[allow(unused_imports)]
 pub use cost::{CostEstimate, CostModel};
-pub use logical::{LogicalExpr, LogicalPlan, LogicalPlanBuilder};
+#[allow(unused_imports)]
+pub use logical::{LogicalExpr, LogicalPlan, LogicalPlanBuilder, ScanOptions};
 pub use table_ref::{ResolvedTable, TableSource};
 
 pub(crate) use logical::{ProjectionExpr, ScanCandidates, ScanExpr};
@@ -25,14 +26,23 @@ use rules::RewriteRule;
 
 pub struct Planner<'a> {
     context: PlanContext<'a>,
+    cost_model: cost::CostModel,
     rules: Vec<Box<dyn RewriteRule<'a> + 'a>>,
 }
 
 impl<'a> Planner<'a> {
     pub fn new(context: PlanContext<'a>) -> Self {
-        let rules: Vec<Box<dyn RewriteRule<'a> + 'a>> =
-            vec![Box::new(heuristics::BaselineScanRule::new())];
-        Self { context, rules }
+        let cost_model = cost::CostModel::from_parameters(context.cost_parameters());
+        let rules: Vec<Box<dyn RewriteRule<'a> + 'a>> = vec![
+            Box::new(heuristics::ProjectionPushdownRule::new()),
+            Box::new(heuristics::FilterPushdownRule::new()),
+            Box::new(heuristics::BaselineScanRule::new()),
+        ];
+        Self {
+            context,
+            cost_model,
+            rules,
+        }
     }
 
     pub fn optimize(&self, plan: LogicalPlan<'a>) -> Result<LogicalPlan<'a>, SqlDatabaseError> {
@@ -48,6 +58,7 @@ impl<'a> Planner<'a> {
                 break;
             }
         }
+        memo.choose_best_expressions(&self.context, &self.cost_model);
         Ok(memo.rebuild_logical())
     }
 }

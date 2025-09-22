@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use crate::{compare_values, ColumnType, Predicate, SqlDatabaseError, Value};
+use crate::{compare_values, ColumnType, Predicate, SelectColumns, SqlDatabaseError, Value};
 
 #[derive(Debug, Clone)]
 pub struct ExternalColumn {
@@ -28,7 +28,8 @@ impl Default for ExternalCostFactors {
 }
 
 pub struct ExternalScanRequest<'a> {
-    pub predicate: Option<&'a Predicate>,
+    pub(crate) predicate: Option<&'a Predicate>,
+    pub(crate) projected_columns: Option<&'a SelectColumns>,
 }
 
 pub struct ExternalScanResult {

@@ -1596,6 +1596,7 @@ impl SqlDatabase {
         let connector = entry.connector.as_ref();
         let request = external::ExternalScanRequest {
             predicate: scan.options.pushdown_predicate.as_ref(),
+            projected_columns: scan.options.projected_columns.as_ref(),
         };
         let result = connector.scan(request)?;
         let total_rows = result.rows.len();
@@ -1911,9 +1912,10 @@ impl SqlDatabase {
                         .iter()
                         .position(|c| c.name.eq_ignore_ascii_case(table_column))
                         .ok_or_else(|| SqlDatabaseError::UnknownColumn(table_column.clone()))?;
-                    let scan = entry
-                        .connector
-                        .scan(external::ExternalScanRequest { predicate: None })?;
+                    let scan = entry.connector.scan(external::ExternalScanRequest {
+                        predicate: None,
+                        projected_columns: None,
+                    })?;
                     let lookup_values = scan
                         .rows
                         .into_iter()
@@ -2581,9 +2583,10 @@ impl SqlDatabase {
                 } else if let Some((_, entry)) =
                     Self::lookup_relation(&self.external_tables, other_table)
                 {
-                    let scan = entry
-                        .connector
-                        .scan(external::ExternalScanRequest { predicate: None })?;
+                    let scan = entry.connector.scan(external::ExternalScanRequest {
+                        predicate: None,
+                        projected_columns: None,
+                    })?;
                     let other_idx = entry
                         .schema
                         .columns
@@ -2840,6 +2843,22 @@ enum Statement {
 enum SelectColumns {
     All,
     Some(Vec<SelectItem>),
+}
+
+impl SelectColumns {
+    pub(crate) fn is_all(&self) -> bool {
+        matches!(self, SelectColumns::All)
+    }
+
+    pub(crate) fn includes_column(&self, column: &str) -> bool {
+        match self {
+            SelectColumns::All => true,
+            SelectColumns::Some(items) => items.iter().any(|item| match item {
+                SelectItem::Column(name) => name.eq_ignore_ascii_case(column),
+                SelectItem::WindowFunction(_) => false,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -6093,8 +6112,11 @@ mod tests {
             column: "author_id".into(),
             value: Value::Integer(2),
         };
-        let cost_model = CostModel::new(8192.0, 1.0);
-        let scan_cost = cost_model.estimate_scan(&books_ctx, Some(&predicate));
+        let cost_model = CostModel::new(8192.0, 1.0, 1.0);
+        let mut scan_options = planner::ScanOptions::default();
+        scan_options.pushdown_predicate = Some(predicate.clone());
+        let scan_cost =
+            cost_model.estimate_scan(&books_ctx, &planner::ScanCandidates::AllRows, &scan_options);
         assert!(scan_cost.cardinality.estimated_rows > 0.0);
 
         let join_predicate = JoinPredicate::inner("id", "author_id");
@@ -6185,7 +6207,12 @@ mod tests {
 
     fn plan_components<'a>(
         plan: &'a planner::LogicalPlan<'a>,
-    ) -> (&'a SelectColumns, Option<&'a Predicate>, &'a ScanCandidates) {
+    ) -> (
+        &'a SelectColumns,
+        Option<&'a Predicate>,
+        &'a ScanCandidates,
+        &'a planner::ScanOptions,
+    ) {
         match &plan.root {
             LogicalExpr::Projection(projection) => match projection.input.as_ref() {
                 LogicalExpr::Filter(filter) => match filter.input.as_ref() {
@@ -6193,10 +6220,13 @@ mod tests {
                         &projection.columns,
                         Some(&filter.predicate),
                         &scan.candidates,
+                        &scan.options,
                     ),
                     _ => panic!("unexpected logical plan shape"),
                 },
-                LogicalExpr::Scan(scan) => (&projection.columns, None, &scan.candidates),
+                LogicalExpr::Scan(scan) => {
+                    (&projection.columns, None, &scan.candidates, &scan.options)
+                }
                 _ => panic!("unexpected logical plan shape"),
             },
             _ => panic!("unexpected logical plan root"),
@@ -6225,7 +6255,7 @@ mod tests {
         };
 
         let plan = optimized_plan_for(&db, "events", Some(predicate), SelectColumns::All);
-        let (_, _, candidates) = plan_components(&plan);
+        let (_, _, candidates, _) = plan_components(&plan);
 
         match candidates {
             ScanCandidates::Fixed(rows) => assert_eq!(rows.as_slice(), &[0]),
@@ -6264,7 +6294,7 @@ mod tests {
             Some(predicate),
             SelectColumns::Some(vec![SelectItem::Column("id".into())]),
         );
-        let (_, _, candidates) = plan_components(&plan);
+        let (_, _, candidates, _) = plan_components(&plan);
 
         match candidates {
             ScanCandidates::Fixed(rows) => assert_eq!(rows.as_slice(), &[0]),
@@ -6283,6 +6313,33 @@ mod tests {
     }
 
     #[test]
+    fn planner_projection_pushdown_tracks_required_columns() {
+        let mut db = SqlDatabase::new();
+        db.execute("CREATE TABLE metrics (id INT, score INT, extra INT);")
+            .unwrap();
+        db.execute("INSERT INTO metrics VALUES (1, 10, 5);")
+            .unwrap();
+
+        let plan = optimized_plan_for(
+            &db,
+            "metrics",
+            None,
+            SelectColumns::Some(vec![
+                SelectItem::Column("id".into()),
+                SelectItem::Column("score".into()),
+            ]),
+        );
+        let (_, _, _, options) = plan_components(&plan);
+
+        match options.projected_columns.as_ref() {
+            Some(SelectColumns::Some(items)) => {
+                assert_eq!(items.len(), 2, "expected projected columns pushdown");
+            }
+            other => panic!("expected scan options to include projection pushdown, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn planner_without_predicate_scans_all_rows() {
         let mut db = SqlDatabase::new();
         db.execute("CREATE TABLE metrics (id INT, score INT);")
@@ -6291,7 +6348,7 @@ mod tests {
             .unwrap();
 
         let plan = optimized_plan_for(&db, "metrics", None, SelectColumns::All);
-        let (_, predicate, candidates) = plan_components(&plan);
+        let (_, predicate, candidates, _) = plan_components(&plan);
 
         assert!(predicate.is_none());
         match candidates {
