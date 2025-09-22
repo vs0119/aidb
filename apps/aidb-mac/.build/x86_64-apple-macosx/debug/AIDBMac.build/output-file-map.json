@@ -1,0 +1,35 @@
+{
+  "": {
+    "swift-dependencies": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/master.swiftdeps"
+  },
+  "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/AIDBClient.swift": {
+    "dependencies": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBClient.d",
+    "object": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBClient.swift.o",
+    "swiftmodule": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBClient~partial.swiftmodule",
+    "swift-dependencies": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBClient.swiftdeps"
+  },
+  "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/AIDBMacApp.swift": {
+    "dependencies": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBMacApp.d",
+    "object": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBMacApp.swift.o",
+    "swiftmodule": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBMacApp~partial.swiftmodule",
+    "swift-dependencies": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBMacApp.swiftdeps"
+  },
+  "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/DesignSystem.swift": {
+    "dependencies": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/DesignSystem.d",
+    "object": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/DesignSystem.swift.o",
+    "swiftmodule": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/DesignSystem~partial.swiftmodule",
+    "swift-dependencies": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/DesignSystem.swiftdeps"
+  },
+  "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/Models.swift": {
+    "dependencies": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Models.d",
+    "object": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Models.swift.o",
+    "swiftmodule": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Models~partial.swiftmodule",
+    "swift-dependencies": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Models.swiftdeps"
+  },
+  "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/Views.swift": {
+    "dependencies": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Views.d",
+    "object": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Views.swift.o",
+    "swiftmodule": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Views~partial.swiftmodule",
+    "swift-dependencies": "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Views.swiftdeps"
+  }
+}

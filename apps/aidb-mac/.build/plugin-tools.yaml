@@ -1,0 +1,81 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "AIDBMac-x86_64-apple-macosx15.0-debug.exe": ["<AIDBMac-x86_64-apple-macosx15.0-debug.exe>"]
+  "AIDBMac-x86_64-apple-macosx15.0-debug.module": ["<AIDBMac-x86_64-apple-macosx15.0-debug.module>"]
+  "PackageStructure": ["<PackageStructure>"]
+  "main": ["<AIDBMac-x86_64-apple-macosx15.0-debug.exe>","<AIDBMac-x86_64-apple-macosx15.0-debug.module>"]
+  "test": ["<AIDBMac-x86_64-apple-macosx15.0-debug.exe>","<AIDBMac-x86_64-apple-macosx15.0-debug.module>"]
+default: "main"
+nodes:
+  "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+  "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac":
+    is-mutated: true
+commands:
+  "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac-entitlement.plist":
+    tool: write-auxiliary-file
+    inputs: ["<entitlement-plist>","<com.apple.security.get-task-allow>"]
+    outputs: ["/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac-entitlement.plist"]
+    description: "Write auxiliary file /Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac-entitlement.plist"
+
+  "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/AIDBClient.swift","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/AIDBMacApp.swift","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/DesignSystem.swift","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/Models.swift","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/Views.swift"]
+    outputs: ["/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/sources"]
+    description: "Write auxiliary file /Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/sources"
+
+  "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.product/Objects.LinkFileList":
+    tool: write-auxiliary-file
+    inputs: ["<link-file-list>","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBClient.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBMacApp.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/DesignSystem.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Models.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Views.swift.o"]
+    outputs: ["/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.product/Objects.LinkFileList"]
+    description: "Write auxiliary file /Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.product/Objects.LinkFileList"
+
+  "/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"]
+    outputs: ["/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+
+  "<AIDBMac-x86_64-apple-macosx15.0-debug.exe>":
+    tool: phony
+    inputs: ["<AIDBMac-x86_64-apple-macosx15.0-debug.exe-CodeSigning>"]
+    outputs: ["<AIDBMac-x86_64-apple-macosx15.0-debug.exe>"]
+
+  "<AIDBMac-x86_64-apple-macosx15.0-debug.module>":
+    tool: phony
+    inputs: ["/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBClient.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBMacApp.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/DesignSystem.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Models.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Views.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/Modules/AIDBMac.swiftmodule"]
+    outputs: ["<AIDBMac-x86_64-apple-macosx15.0-debug.module>"]
+
+  "C.AIDBMac-x86_64-apple-macosx15.0-debug.exe":
+    tool: shell
+    inputs: ["/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBClient.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBMacApp.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/DesignSystem.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Models.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Views.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.product/Objects.LinkFileList"]
+    outputs: ["/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac"]
+    description: "Linking ./.build/x86_64-apple-macosx/debug/AIDBMac"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-L","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug","-o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac","-module-name","AIDBMac","-Xlinker","-no_warn_duplicate_libraries","-emit-executable","-Xlinker","-alias","-Xlinker","_AIDBMac_main","-Xlinker","_main","-Xlinker","-rpath","-Xlinker","@loader_path","@/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.product/Objects.LinkFileList","-target","x86_64-apple-macosx13.0","-Xlinker","-add_ast_path","-Xlinker","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/Modules/AIDBMac.swiftmodule","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g"]
+
+  "C.AIDBMac-x86_64-apple-macosx15.0-debug.exe-entitlements":
+    tool: shell
+    inputs: ["/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac-entitlement.plist"]
+    outputs: ["<AIDBMac-x86_64-apple-macosx15.0-debug.exe-CodeSigning>"]
+    description: "Applying debug entitlements to ./.build/x86_64-apple-macosx/debug/AIDBMac"
+    args: ["codesign","--force","--sign","-","--entitlements","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac-entitlement.plist","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac"]
+
+  "C.AIDBMac-x86_64-apple-macosx15.0-debug.module":
+    tool: shell
+    inputs: ["/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/AIDBClient.swift","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/AIDBMacApp.swift","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/DesignSystem.swift","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/Models.swift","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/AIDBMac/Views.swift","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/sources"]
+    outputs: ["/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBClient.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/AIDBMacApp.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/DesignSystem.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Models.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/Views.swift.o","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/Modules/AIDBMac.swiftmodule"]
+    description: "Compiling Swift Module 'AIDBMac' (5 sources)"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-module-name","AIDBMac","-emit-dependencies","-emit-module","-emit-module-path","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/Modules/AIDBMac.swiftmodule","-output-file-map","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/output-file-map.json","-incremental","-c","@/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/AIDBMac.build/sources","-I","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/Modules","-target","x86_64-apple-macosx13.0","-enable-batch-mode","-index-store-path","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/index/store","-Onone","-enable-testing","-j12","-DSWIFT_PACKAGE","-DDEBUG","-module-cache-path","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/.build/x86_64-apple-macosx/debug/ModuleCache","-parseable-output","-Xfrontend","-entry-point-function-name","-Xfrontend","AIDBMac_main","-swift-version","5","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g","-Xcc","-isysroot","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks","-Xcc","-fPIC","-Xcc","-g","-package-name","aidb_mac"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Sources/","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Package.swift","/Users/vivekkumar/Library/Mobile Documents/com~apple~CloudDocs/aidb/apps/aidb-mac/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+
