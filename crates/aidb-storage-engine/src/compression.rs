@@ -366,7 +366,7 @@ impl CompressionManager {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompressedData {
     pub algorithm: CompressionAlgorithm,
     pub data: Vec<u8>,
