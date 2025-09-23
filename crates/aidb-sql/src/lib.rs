@@ -1,11 +1,10 @@
-use chrono::Datelike;
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use roxmltree::Document;
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -14,11 +13,17 @@ use thiserror::Error;
 mod execution;
 mod external;
 mod jit;
+mod partitioning;
 mod planner;
 
 use execution::TaskScheduler;
 
 pub use external::{ExternalCostFactors, ExternalSource, ParquetConnector};
+use partitioning::{
+    build_partitioning_scheme, InsertRouter, PartitionManager, PartitionSchemeDefinition,
+    PartitioningDefinition,
+};
+pub use partitioning::{PartitionBounds, PartitionError, PartitionMetadata, PartitioningScheme};
 pub use planner::JoinPredicate;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -72,8 +77,8 @@ fn column_type_name(ty: ColumnType) -> &'static str {
 pub(crate) struct Table {
     pub(crate) columns: Vec<Column>,
     pub(crate) rows: Vec<Vec<Value>>,
-    pub(crate) partitioning: Option<TimePartitioning>,
-    pub(crate) partitions: BTreeMap<PartitionKey, Vec<usize>>,
+    pub(crate) partitioning: Option<PartitionSchemeDefinition>,
+    pub(crate) partitions: HashMap<String, Vec<usize>>,
     pub(crate) json_indexes: HashMap<usize, JsonIndex>,
     pub(crate) jsonb_indexes: HashMap<usize, JsonIndex>,
     pub(crate) xml_indexes: HashMap<usize, XmlIndex>,
@@ -89,7 +94,7 @@ impl Default for Table {
             columns: Vec::new(),
             rows: Vec::new(),
             partitioning: None,
-            partitions: BTreeMap::new(),
+            partitions: HashMap::new(),
             json_indexes: HashMap::new(),
             jsonb_indexes: HashMap::new(),
             xml_indexes: HashMap::new(),
@@ -216,46 +221,9 @@ struct GraphEdge {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TimePartitioning {
-    column_index: usize,
-    column_name: String,
-    granularity: PartitionGranularity,
-}
-
-impl TimePartitioning {
-    fn matches_column(&self, column: &str) -> bool {
-        self.column_name.eq_ignore_ascii_case(column)
-    }
-
-    fn partition_key(&self, value: &Value) -> Option<PartitionKey> {
-        match value {
-            Value::Timestamp(timestamp) => Some(self.partition_key_from_datetime(timestamp)),
-            _ => None,
-        }
-    }
-
-    fn partition_key_from_datetime(&self, timestamp: &DateTime<Utc>) -> PartitionKey {
-        match self.granularity {
-            PartitionGranularity::Day => {
-                let days = timestamp.date_naive().num_days_from_ce();
-                PartitionKey(days as i64)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct PartitionKey(i64);
-
-#[derive(Debug, Clone, Copy)]
-enum PartitionGranularity {
-    Day,
-}
-
-#[derive(Debug, Clone)]
 struct PartitioningInfo {
     column: String,
-    granularity: PartitionGranularity,
+    definition: PartitioningDefinition,
 }
 
 const TABLE_STATS_TABLE: &str = "__aidb_table_stats";
@@ -418,6 +386,8 @@ pub enum SqlDatabaseError {
     UnknownColumn(String),
     #[error("schema mismatch: {0}")]
     SchemaMismatch(String),
+    #[error("partition error: {0}")]
+    Partition(String),
     #[error("partition column '{0}' requires TIMESTAMP type")]
     InvalidPartitionColumn(String),
     #[error("graph '{0}' already exists")]
@@ -438,6 +408,12 @@ pub enum SqlDatabaseError {
     JitUnsupported,
     #[error("column '{0}' not found")]
     ColumnNotFound(String),
+}
+
+impl From<PartitionError> for SqlDatabaseError {
+    fn from(err: PartitionError) -> Self {
+        SqlDatabaseError::Partition(err.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1026,20 +1002,10 @@ impl SqlDatabase {
         }
         initialize_secondary_indexes(&mut table);
         if let Some(info) = partitioning {
-            let column_index = table
-                .columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(&info.column))
-                .ok_or_else(|| SqlDatabaseError::UnknownColumn(info.column.clone()))?;
-            if table.columns[column_index].ty != ColumnType::Timestamp {
-                return Err(SqlDatabaseError::InvalidPartitionColumn(info.column));
-            }
-            let column_name = table.columns[column_index].name.clone();
-            table.partitioning = Some(TimePartitioning {
-                column_index,
-                column_name,
-                granularity: info.granularity,
-            });
+            let PartitioningInfo { column, definition } = info;
+            let scheme = build_partitioning_scheme(&table, &column, definition)?;
+            table.partitioning = Some(scheme);
+            PartitionManager::new(&mut table).rebuild()?;
         }
         let table_name = name.clone();
         self.tables.insert(name, table);
@@ -1128,15 +1094,9 @@ impl SqlDatabase {
                 let coerced = coerce_value(value, table.columns[col_idx].ty)?;
                 new_row[col_idx] = coerced;
             }
-            let row_index = table.rows.len();
             table.rows.push(new_row);
-            if let Some(partitioning) = &table.partitioning {
-                if let Some(value) = table.rows[row_index].get(partitioning.column_index) {
-                    if let Some(key) = partitioning.partition_key(value) {
-                        table.partitions.entry(key).or_default().push(row_index);
-                    }
-                }
-            }
+            let row_index = table.rows.len() - 1;
+            InsertRouter::new(table).route(row_index)?;
             update_indexes_for_row(table, row_index);
             inserted += 1;
         }
@@ -2382,10 +2342,8 @@ impl SqlDatabase {
             }
         }
 
-        if modified && target_table.partitioning.is_some() {
-            rebuild_partitions(target_table);
-        }
         if modified {
+            PartitionManager::new(target_table).rebuild()?;
             rebuild_secondary_indexes(target_table);
             self.invalidate_cache_for_table(&target_name);
             self.on_relation_changed(&target_name)?;
@@ -3124,31 +3082,197 @@ fn parse_partitioning_clause(input: &str) -> Result<(PartitioningInfo, &str), Sq
     let rest = expect_keyword_ci(input, "PARTITION")?;
     let rest = expect_keyword_ci(rest, "BY")?;
     let rest = rest.trim_start();
-    if let Some(rest) = strip_keyword_ci(rest, "DAY") {
-        let (column_raw, remainder) = take_parenthesized(rest)?;
-        let column = column_raw.trim();
-        if column.is_empty() {
-            return Err(SqlDatabaseError::Parse(
-                "PARTITION BY DAY requires a column name".into(),
-            ));
-        }
-        if column.contains(',') {
-            return Err(SqlDatabaseError::Parse(
-                "only a single column can be used for time partitioning".into(),
-            ));
-        }
-        Ok((
-            PartitioningInfo {
-                column: column.to_string(),
-                granularity: PartitionGranularity::Day,
-            },
-            remainder,
-        ))
-    } else {
-        Err(SqlDatabaseError::Parse(
-            "unsupported time partition granularity".into(),
-        ))
+    if let Some(after_range) = strip_keyword_ci(rest, "RANGE") {
+        return parse_range_partitioning(after_range);
     }
+    if let Some(after_hash) = strip_keyword_ci(rest, "HASH") {
+        return parse_hash_partitioning(after_hash);
+    }
+    if let Some(after_list) = strip_keyword_ci(rest, "LIST") {
+        return parse_list_partitioning(after_list);
+    }
+    Err(SqlDatabaseError::Parse(
+        "unsupported partitioning strategy".into(),
+    ))
+}
+
+fn parse_range_partitioning(input: &str) -> Result<(PartitioningInfo, &str), SqlDatabaseError> {
+    let (column_raw, rest_after_column) = take_parenthesized(input)?;
+    let column = column_raw.trim();
+    if column.is_empty() {
+        return Err(SqlDatabaseError::Parse(
+            "PARTITION BY RANGE requires a column".into(),
+        ));
+    }
+    if column.contains(',') {
+        return Err(SqlDatabaseError::Parse(
+            "only a single column can be used for partitioning".into(),
+        ));
+    }
+    let (partitions_raw, remainder) = take_parenthesized(rest_after_column)?;
+    let mut partitions = Vec::new();
+    for (idx, spec) in split_comma(&partitions_raw)?.into_iter().enumerate() {
+        let metadata = parse_range_partition_spec(&spec, idx)?;
+        partitions.push(metadata);
+    }
+    Ok((
+        PartitioningInfo {
+            column: column.to_string(),
+            definition: PartitioningDefinition::Range { partitions },
+        },
+        remainder,
+    ))
+}
+
+fn parse_hash_partitioning(input: &str) -> Result<(PartitioningInfo, &str), SqlDatabaseError> {
+    let (column_raw, rest_after_column) = take_parenthesized(input)?;
+    let column = column_raw.trim();
+    if column.is_empty() {
+        return Err(SqlDatabaseError::Parse(
+            "PARTITION BY HASH requires a column".into(),
+        ));
+    }
+    if column.contains(',') {
+        return Err(SqlDatabaseError::Parse(
+            "only a single column can be used for partitioning".into(),
+        ));
+    }
+    let rest = expect_keyword_ci(rest_after_column, "PARTITIONS")?;
+    let rest = rest.trim_start();
+    let mut digits_len = 0usize;
+    for ch in rest.chars() {
+        if ch.is_ascii_digit() {
+            digits_len += 1;
+        } else {
+            break;
+        }
+    }
+    if digits_len == 0 {
+        return Err(SqlDatabaseError::Parse(
+            "expected integer partition count".into(),
+        ));
+    }
+    let (digits, remainder) = rest.split_at(digits_len);
+    let partitions: usize = digits
+        .parse()
+        .map_err(|_| SqlDatabaseError::Parse("invalid partition count".into()))?;
+    Ok((
+        PartitioningInfo {
+            column: column.to_string(),
+            definition: PartitioningDefinition::Hash { partitions },
+        },
+        remainder,
+    ))
+}
+
+fn parse_list_partitioning(input: &str) -> Result<(PartitioningInfo, &str), SqlDatabaseError> {
+    let (column_raw, rest_after_column) = take_parenthesized(input)?;
+    let column = column_raw.trim();
+    if column.is_empty() {
+        return Err(SqlDatabaseError::Parse(
+            "PARTITION BY LIST requires a column".into(),
+        ));
+    }
+    if column.contains(',') {
+        return Err(SqlDatabaseError::Parse(
+            "only a single column can be used for partitioning".into(),
+        ));
+    }
+    let (partitions_raw, remainder) = take_parenthesized(rest_after_column)?;
+    let mut partitions = Vec::new();
+    for (idx, spec) in split_comma(&partitions_raw)?.into_iter().enumerate() {
+        let metadata = parse_list_partition_spec(&spec, idx)?;
+        partitions.push(metadata);
+    }
+    Ok((
+        PartitioningInfo {
+            column: column.to_string(),
+            definition: PartitioningDefinition::List { partitions },
+        },
+        remainder,
+    ))
+}
+
+fn parse_partition_label<'a>(
+    input: &'a str,
+    index: usize,
+) -> Result<(String, &'a str), SqlDatabaseError> {
+    let trimmed = input.trim_start();
+    if let Some(rest) = strip_keyword_ci(trimmed, "PARTITION") {
+        let (name, remainder) = parse_identifier(rest)?;
+        Ok((name, remainder))
+    } else {
+        Ok((format!("p{index}"), trimmed))
+    }
+}
+
+fn parse_range_partition_spec(
+    spec: &str,
+    index: usize,
+) -> Result<PartitionMetadata, SqlDatabaseError> {
+    let (name, rest) = parse_partition_label(spec, index)?;
+    let rest = expect_keyword_ci(rest, "VALUES")?;
+    let rest = expect_keyword_ci(rest, "LESS")?;
+    let rest = expect_keyword_ci(rest, "THAN")?;
+    let rest = rest.trim_start();
+    if let Some(after_max) = strip_keyword_ci(rest, "MAXVALUE") {
+        if !after_max.trim().is_empty() {
+            return Err(SqlDatabaseError::Parse(
+                "unexpected tokens after MAXVALUE".into(),
+            ));
+        }
+        return Ok(PartitionMetadata {
+            name,
+            bounds: PartitionBounds::Range { upper: None },
+        });
+    }
+    let (value_raw, remainder) = take_parenthesized(rest)?;
+    if !remainder.trim().is_empty() {
+        return Err(SqlDatabaseError::Parse(
+            "unexpected tokens after range boundary".into(),
+        ));
+    }
+    let value = parse_literal(value_raw.trim())?;
+    Ok(PartitionMetadata {
+        name,
+        bounds: PartitionBounds::Range { upper: Some(value) },
+    })
+}
+
+fn parse_list_partition_spec(
+    spec: &str,
+    index: usize,
+) -> Result<PartitionMetadata, SqlDatabaseError> {
+    let (name, rest) = parse_partition_label(spec, index)?;
+    let rest_trimmed = rest.trim_start();
+    if let Some(after_default) = strip_keyword_ci(rest_trimmed, "DEFAULT") {
+        if !after_default.trim().is_empty() {
+            return Err(SqlDatabaseError::Parse(
+                "unexpected tokens after DEFAULT".into(),
+            ));
+        }
+        return Ok(PartitionMetadata {
+            name,
+            bounds: PartitionBounds::Default,
+        });
+    }
+    let rest = expect_keyword_ci(rest_trimmed, "VALUES")?;
+    let rest = expect_keyword_ci(rest, "IN")?;
+    let (values_raw, remainder) = take_parenthesized(rest)?;
+    if !remainder.trim().is_empty() {
+        return Err(SqlDatabaseError::Parse(
+            "unexpected tokens after LIST partition definition".into(),
+        ));
+    }
+    let mut values = Vec::new();
+    for value_str in split_comma(&values_raw)? {
+        let value = parse_literal(value_str.trim())?;
+        values.push(value);
+    }
+    Ok(PartitionMetadata {
+        name,
+        bounds: PartitionBounds::List { values },
+    })
 }
 
 fn parse_analyze(input: &str) -> Result<Statement, SqlDatabaseError> {
@@ -3945,19 +4069,6 @@ fn infer_column_type(rows: &[Vec<Value>], index: usize) -> ColumnType {
         }
     }
     ColumnType::Text
-}
-
-fn rebuild_partitions(table: &mut Table) {
-    table.partitions.clear();
-    if let Some(partitioning) = &table.partitioning {
-        for (idx, row) in table.rows.iter().enumerate() {
-            if let Some(value) = row.get(partitioning.column_index) {
-                if let Some(key) = partitioning.partition_key(value) {
-                    table.partitions.entry(key).or_default().push(idx);
-                }
-            }
-        }
-    }
 }
 
 fn clamp_u64_to_i64(value: u64) -> i64 {
@@ -5262,7 +5373,7 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-fn geometry_to_string(geometry: &Geometry) -> String {
+pub(crate) fn geometry_to_string(geometry: &Geometry) -> String {
     match geometry {
         Geometry::Point { x, y } => format!("POINT({x} {y})"),
         Geometry::BoundingBox {
@@ -5448,8 +5559,15 @@ mod tests {
     #[test]
     fn time_series_partition_and_range_query() {
         let mut db = SqlDatabase::new();
-        db.execute("CREATE TABLE readings (ts TIMESTAMP, value INT) PARTITION BY DAY(ts);")
-            .unwrap();
+        db.execute(
+            "CREATE TABLE readings (ts TIMESTAMP, value INT) \
+             PARTITION BY RANGE(ts) (\
+                 PARTITION p0 VALUES LESS THAN ('2023-01-02T00:00:00Z'), \
+                 PARTITION p1 VALUES LESS THAN ('2023-01-03T00:00:00Z'), \
+                 PARTITION pmax VALUES LESS THAN MAXVALUE\
+             );",
+        )
+        .unwrap();
         db.execute("INSERT INTO readings VALUES ('2023-01-01T12:00:00Z', 10);")
             .unwrap();
         db.execute("INSERT INTO readings VALUES ('2023-01-02T08:00:00Z', 20);")
@@ -6238,7 +6356,11 @@ mod tests {
     fn planner_partition_pruning_selects_partition_rows() {
         let mut db = SqlDatabase::new();
         db.execute(
-            "CREATE TABLE events (id INT, event_time TIMESTAMP) PARTITION BY DAY(event_time);",
+            "CREATE TABLE events (id INT, event_time TIMESTAMP) \
+             PARTITION BY RANGE(event_time) (\
+                 PARTITION p0 VALUES LESS THAN ('2024-01-02T00:00:00Z'), \
+                 PARTITION pmax VALUES LESS THAN MAXVALUE\
+             );",
         )
         .unwrap();
         db.execute("INSERT INTO events VALUES (1, '2024-01-01T00:00:00Z');")
