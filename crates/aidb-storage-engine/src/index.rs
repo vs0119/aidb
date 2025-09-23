@@ -3,7 +3,6 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytemuck::{bytes_of, from_bytes, Pod, Zeroable};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
@@ -15,7 +14,7 @@ const PAGE_TYPE_BTREE_INTERNAL: u8 = 0x21;
 const PAGE_TYPE_BTREE_LEAF: u8 = 0x22;
 const NULL_PAGE: PageId = 0;
 
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize)]
 #[repr(C)]
 struct NodeHeader {
     magic: u32,
@@ -45,8 +44,11 @@ impl Default for NodeHeader {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct NodePayload<K: BTreeKey> {
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct NodePayload<K>
+where
+    K: BTreeKey + for<'de> serde::Deserialize<'de>,
+{
     keys: Vec<K>,
     children: Vec<PageId>,
     values: Vec<Vec<RowId>>,
@@ -154,9 +156,9 @@ impl<K: BTreeKey> BTreeNode<K> {
     }
 }
 
-pub trait BTreeKey: Ord + Clone + Serialize + DeserializeOwned + Send + Sync + 'static {}
+pub trait BTreeKey: Ord + Clone + Serialize + serde::de::DeserializeOwned + Send + Sync + 'static {}
 
-impl<T> BTreeKey for T where T: Ord + Clone + Serialize + DeserializeOwned + Send + Sync + 'static {}
+impl<T> BTreeKey for T where T: Ord + Clone + Serialize + serde::de::DeserializeOwned + Send + Sync + 'static {}
 
 #[derive(Debug, Clone)]
 struct TreeMetadata {
@@ -381,12 +383,12 @@ impl<K: BTreeKey> BPlusTree<K> {
     async fn read_node(&self, page_id: PageId) -> Result<BTreeNode<K>> {
         let page = self.buffer_pool.get_page(page_id).await?;
         let page_guard = page.read().await;
-        let header_slice = &page_guard.data
-            [PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + std::mem::size_of::<NodeHeader>()];
+        let header_end = PAGE_HEADER_SIZE + 32; // Size estimate for NodeHeader
+        let header_slice = &page_guard.data[PAGE_HEADER_SIZE..header_end];
         let mut header: NodeHeader = if header_slice.iter().all(|b| *b == 0) {
             NodeHeader::default()
         } else {
-            *from_bytes::<NodeHeader>(header_slice)
+            bincode::deserialize(header_slice).unwrap_or_default()
         };
 
         if header.magic != NODE_MAGIC {
@@ -398,7 +400,9 @@ impl<K: BTreeKey> BPlusTree<K> {
             };
         }
 
-        let payload_start = PAGE_HEADER_SIZE + std::mem::size_of::<NodeHeader>();
+        let header_bytes = bincode::serialize(&header)
+            .map_err(|err| StorageEngineError::PageCorruption(err.to_string()))?;
+        let payload_start = PAGE_HEADER_SIZE + header_bytes.len();
         let payload_end = payload_start + header.payload_size as usize;
         let payload = if header.payload_size == 0 {
             NodePayload {
@@ -427,17 +431,18 @@ impl<K: BTreeKey> BPlusTree<K> {
         let payload = node.payload();
         let encoded = bincode::serialize(&payload)
             .map_err(|err| StorageEngineError::PageCorruption(err.to_string()))?;
-        let payload_start = PAGE_HEADER_SIZE + std::mem::size_of::<NodeHeader>();
+        let mut header = node.header;
+        header.payload_size = encoded.len() as u32;
+        let header_bytes = bincode::serialize(&header)
+            .map_err(|err| StorageEngineError::PageCorruption(err.to_string()))?;
+        let payload_start = PAGE_HEADER_SIZE + header_bytes.len();
         let payload_end = payload_start + encoded.len();
         if payload_end > PAGE_SIZE {
             return Err(StorageEngineError::OutOfSpace);
         }
         self.initialize_page_header(&mut guard, node, encoded.len());
-        let mut header = node.header;
-        header.payload_size = encoded.len() as u32;
-        let header_bytes = bytes_of(&header);
-        guard.data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + header_bytes.len()]
-            .copy_from_slice(header_bytes);
+        let header_end = PAGE_HEADER_SIZE + header_bytes.len();
+        guard.data[PAGE_HEADER_SIZE..header_end].copy_from_slice(&header_bytes);
         guard.data[payload_start..payload_end].copy_from_slice(&encoded);
         if payload_end < PAGE_SIZE {
             for byte in &mut guard.data[payload_end..] {
@@ -742,10 +747,11 @@ impl<K: BTreeKey> BPlusTree<K> {
         if let Some(left_page) = left_page {
             let mut left = self.read_node(left_page).await?;
             if node.is_leaf() {
+                let next_leaf = node.next_leaf();
                 left.keys.extend(node.keys);
                 left.values.extend(node.values);
-                left.set_next_leaf(node.next_leaf());
-                if let Some(next_page) = node.next_leaf() {
+                left.set_next_leaf(next_leaf);
+                if let Some(next_page) = next_leaf {
                     let mut next_node = self.read_node(next_page).await?;
                     next_node.set_prev_leaf(Some(left.page_id));
                     next_node.sync_header();
@@ -773,10 +779,11 @@ impl<K: BTreeKey> BPlusTree<K> {
         if let Some(right_page) = right_page {
             let mut right = self.read_node(right_page).await?;
             if node.is_leaf() {
+                let next_leaf = right.next_leaf();
                 node.keys.extend(right.keys);
                 node.values.extend(right.values);
-                node.set_next_leaf(right.next_leaf());
-                if let Some(next_page) = right.next_leaf() {
+                node.set_next_leaf(next_leaf);
+                if let Some(next_page) = next_leaf {
                     let mut next_node = self.read_node(next_page).await?;
                     next_node.set_prev_leaf(Some(node.page_id));
                     next_node.sync_header();
