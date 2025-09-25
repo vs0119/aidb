@@ -1,22 +1,29 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aidb_core::{Id, JsonValue, Vector};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod buffer;
+pub mod columnar;
 pub mod compression;
 pub mod distributed;
+pub mod lsm;
 pub mod memory;
+pub mod mvcc;
 pub mod page;
 pub mod transaction;
 pub mod vacuum;
 
 pub use buffer::*;
+pub use columnar::*;
 pub use compression::*;
 pub use distributed::*;
+pub use lsm::*;
 pub use memory::*;
+pub use mvcc::*;
 pub use page::*;
 pub use transaction::*;
 pub use vacuum::*;
@@ -117,6 +124,9 @@ pub struct StorageEngine {
     pub compression_manager: Arc<CompressionManager>,
     pub vacuum_manager: Arc<VacuumManager>,
     pub stats: Arc<EngineStats>,
+    pub mvcc_store: Arc<VersionStore>,
+    pub visibility_checker: Arc<VisibilityChecker>,
+    pub mvcc_gc: Arc<MvccGarbageCollector>,
 }
 
 #[derive(Default)]
@@ -145,6 +155,13 @@ impl StorageEngine {
         let compression_manager = Arc::new(CompressionManager::new());
         let vacuum_manager = Arc::new(VacuumManager::new());
         let stats = Arc::new(EngineStats::default());
+        let mvcc_store = Arc::new(VersionStore::default());
+        let visibility_checker = Arc::new(VisibilityChecker::new());
+        let gc = Arc::new(MvccGarbageCollector::start(
+            mvcc_store.clone(),
+            transaction_manager.snapshot_manager(),
+            Duration::from_secs(5),
+        ));
 
         Ok(Self {
             buffer_pool,
@@ -153,6 +170,9 @@ impl StorageEngine {
             compression_manager,
             vacuum_manager,
             stats,
+            mvcc_store,
+            visibility_checker,
+            mvcc_gc: gc,
         })
     }
 
@@ -187,6 +207,7 @@ impl StorageEngine {
         let slot_id = page.write().await.insert_row(&row)?;
         let row_id = RowId { page_id, slot_id };
 
+        self.mvcc_store.register_insert(row_id, row.clone());
         self.stats.page_writes.fetch_add(1, Ordering::Relaxed);
         Ok(row_id)
     }
@@ -200,11 +221,30 @@ impl StorageEngine {
             row_id.page_id,
             transaction::AccessMode::Read,
         );
+
+        if let Some(tuple) = self.mvcc_store.get_tuple(&row_id) {
+            if let Some(version) = self
+                .visibility_checker
+                .select_visible_version(&tuple, &txn.snapshot())
+            {
+                if version.deleted_xid.is_none() {
+                    self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(version));
+                }
+
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            } else {
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+        }
         let page = self.buffer_pool.get_page(row_id.page_id).await?;
         let page_guard = page.read().await;
 
         if let Some(row) = page_guard.get_row(row_id.slot_id)? {
             if row.is_visible(&txn.snapshot()) {
+                self.mvcc_store.register_insert(row_id, row.clone());
                 self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(row));
             }
@@ -244,6 +284,7 @@ impl StorageEngine {
             row.updated_xid = Some(txn.id);
 
             page_guard.update_row(row_id.slot_id, &row)?;
+            self.mvcc_store.register_update(row_id, row.clone(), txn.id);
             self.stats.page_writes.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -269,6 +310,7 @@ impl StorageEngine {
 
             row.deleted_xid = Some(txn.id);
             page_guard.update_row(row_id.slot_id, &row)?;
+            self.mvcc_store.register_delete(row_id, txn.id);
             self.stats.page_writes.fetch_add(1, Ordering::Relaxed);
 
             return Ok(true);
