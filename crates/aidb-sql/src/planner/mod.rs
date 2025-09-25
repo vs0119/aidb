@@ -45,6 +45,7 @@ impl<'a> Planner<'a> {
             Box::new(heuristics::ProjectionPushdownRule::new()),
             Box::new(heuristics::FilterPushdownRule::new()),
             Box::new(heuristics::BaselineScanRule::new()),
+            Box::new(heuristics::IndexSelectionRule::new()),
         ];
         Self {
             contexts,
