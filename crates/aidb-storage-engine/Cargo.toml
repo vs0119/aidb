@@ -15,7 +15,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
-dashmap = "5.5"
+dashmap = "6.1"
 memmap2 = "0.9"
 crossbeam = "0.8"
 atomic = "0.6"

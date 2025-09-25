@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aidb_core::{Id, JsonValue, Vector};
 use dashmap::DashMap;
@@ -7,17 +8,25 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod buffer;
+pub mod columnar;
 pub mod compression;
 pub mod distributed;
 pub mod index;
+pub mod lsm;
+pub mod memory;
+pub mod mvcc;
 pub mod page;
 pub mod transaction;
 pub mod vacuum;
 
 pub use buffer::*;
+pub use columnar::*;
 pub use compression::*;
 pub use distributed::*;
 pub use index::*;
+pub use lsm::*;
+pub use memory::*;
+pub use mvcc::*;
 pub use page::*;
 pub use transaction::*;
 pub use vacuum::*;
@@ -38,6 +47,10 @@ pub enum StorageEngineError {
     CompressionError(String),
     #[error("distributed transaction error: {0}")]
     DistributedTransaction(String),
+    #[error("collection not found: {0}")]
+    CollectionNotFound(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
 }
 
 pub type Result<T> = std::result::Result<T, StorageEngineError>;
@@ -115,6 +128,9 @@ pub struct StorageEngine {
     pub vacuum_manager: Arc<VacuumManager>,
     pub stats: Arc<EngineStats>,
     pub index_registry: Arc<DashMap<String, Arc<dyn IndexMaintenance>>>,
+    pub mvcc_store: Arc<VersionStore>,
+    pub visibility_checker: Arc<VisibilityChecker>,
+    pub mvcc_gc: Arc<MvccGarbageCollector>,
 }
 
 #[derive(Default)]
@@ -146,6 +162,13 @@ impl StorageEngine {
         let vacuum_manager = Arc::new(VacuumManager::new());
         let stats = Arc::new(EngineStats::default());
         let index_registry = Arc::new(DashMap::new());
+        let mvcc_store = Arc::new(VersionStore::default());
+        let visibility_checker = Arc::new(VisibilityChecker::new());
+        let gc = Arc::new(MvccGarbageCollector::start(
+            mvcc_store.clone(),
+            transaction_manager.snapshot_manager(),
+            Duration::from_secs(5),
+        ));
 
         Ok(Self {
             buffer_pool,
@@ -155,6 +178,9 @@ impl StorageEngine {
             vacuum_manager,
             stats,
             index_registry,
+            mvcc_store,
+            visibility_checker,
+            mvcc_gc: gc,
         })
     }
 
@@ -199,6 +225,7 @@ impl StorageEngine {
         drop(page_guard);
         let row_id = RowId { page_id, slot_id };
 
+        self.mvcc_store.register_insert(row_id, row.clone());
         self.stats.page_writes.fetch_add(1, Ordering::Relaxed);
         for maintainer in maintainers {
             maintainer.on_insert(&row, row_id).await?;
@@ -215,11 +242,30 @@ impl StorageEngine {
             row_id.page_id,
             transaction::AccessMode::Read,
         );
+
+        if let Some(tuple) = self.mvcc_store.get_tuple(&row_id) {
+            if let Some(version) = self
+                .visibility_checker
+                .select_visible_version(&tuple, &txn.snapshot())
+            {
+                if version.deleted_xid.is_none() {
+                    self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(version));
+                }
+
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            } else {
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+        }
         let page = self.buffer_pool.get_page(row_id.page_id).await?;
         let page_guard = page.read().await;
 
         if let Some(row) = page_guard.get_row(row_id.slot_id)? {
             if row.is_visible(&txn.snapshot()) {
+                self.mvcc_store.register_insert(row_id, row.clone());
                 self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(row));
             }
@@ -265,6 +311,7 @@ impl StorageEngine {
             row.updated_xid = Some(txn.id);
 
             page_guard.update_row(row_id.slot_id, &row)?;
+            self.mvcc_store.register_update(row_id, row.clone(), txn.id);
             self.stats.page_writes.fetch_add(1, Ordering::Relaxed);
             drop(page_guard);
             for maintainer in maintainers {
@@ -301,6 +348,7 @@ impl StorageEngine {
             let old_row = row.clone();
             row.deleted_xid = Some(txn.id);
             page_guard.update_row(row_id.slot_id, &row)?;
+            self.mvcc_store.register_delete(row_id, txn.id);
             self.stats.page_writes.fetch_add(1, Ordering::Relaxed);
             drop(page_guard);
             for maintainer in maintainers {

@@ -1,5 +1,4 @@
-use std::ops::Bound::Included;
-
+use crate::partitioning::PartitionPruner;
 use crate::{
     canonical_json, coerce_static_value, column_index_in_table, xml_root_name, ColumnType,
     Predicate, SelectColumns, SqlDatabaseError, Value,
@@ -392,54 +391,11 @@ fn partition_prune(
     predicate: &crate::Predicate,
 ) -> Result<Option<Vec<usize>>, SqlDatabaseError> {
     let table = table_ref.table;
-    let partitioning = match &table.partitioning {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-
-    if !partitioning.matches_column(predicate.column_name()) {
+    let Some(scheme) = table.partitioning.as_ref() else {
         return Ok(None);
-    }
-
-    match predicate {
-        crate::Predicate::Equals { value, .. } => {
-            let idx = partitioning.column_index;
-            let column_type = table.columns[idx].ty;
-            let coerced = coerce_static_value(value, column_type)?;
-            if let Some(key) = partitioning.partition_key(&coerced) {
-                let rows = table.partitions.get(&key).cloned().unwrap_or_default();
-                return Ok(Some(rows));
-            }
-            Ok(Some(Vec::new()))
-        }
-        crate::Predicate::Between { start, end, .. } => {
-            let idx = partitioning.column_index;
-            let column_type = table.columns[idx].ty;
-            let start_val = coerce_static_value(start, column_type)?;
-            let end_val = coerce_static_value(end, column_type)?;
-            if let (Some(start_key), Some(end_key)) = (
-                partitioning.partition_key(&start_val),
-                partitioning.partition_key(&end_val),
-            ) {
-                let (lower, upper) = if start_key <= end_key {
-                    (start_key, end_key)
-                } else {
-                    (end_key, start_key)
-                };
-                let mut indices = Vec::new();
-                for rows in table
-                    .partitions
-                    .range((Included(lower), Included(upper)))
-                    .map(|(_, v)| v)
-                {
-                    indices.extend(rows.iter().copied());
-                }
-                return Ok(Some(indices));
-            }
-            Ok(Some(Vec::new()))
-        }
-        _ => Ok(None),
-    }
+    };
+    let pruner = PartitionPruner::new(table, scheme);
+    pruner.prune(predicate).map_err(SqlDatabaseError::from)
 }
 
 fn secondary_index_lookup(
