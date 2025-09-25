@@ -11,6 +11,7 @@ pub mod columnar;
 pub mod compression;
 pub mod distributed;
 pub mod lsm;
+pub mod memory;
 pub mod mvcc;
 pub mod page;
 pub mod transaction;
@@ -21,6 +22,7 @@ pub use columnar::*;
 pub use compression::*;
 pub use distributed::*;
 pub use lsm::*;
+pub use memory::*;
 pub use mvcc::*;
 pub use page::*;
 pub use transaction::*;
@@ -42,6 +44,10 @@ pub enum StorageEngineError {
     CompressionError(String),
     #[error("distributed transaction error: {0}")]
     DistributedTransaction(String),
+    #[error("collection not found: {0}")]
+    CollectionNotFound(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
 }
 
 pub type Result<T> = std::result::Result<T, StorageEngineError>;
