@@ -21,13 +21,13 @@ rust-version = "1.70"
 [workspace.dependencies]
 anyhow = "1"
 bincode = "1"
-env_logger = "0.10"
+env_logger = "0.11"
 log = "0.4"
 parking_lot = "0.12"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 time = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.9"
@@ -36,12 +36,12 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 num_cpus = "1.16"
-dashmap = "5.5"
+dashmap = "6.1"
 memmap2 = "0.9"
 crossbeam = "0.8"
 atomic = "0.6"
